@@ -1,0 +1,220 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Scrollbar styling for light & dark themes */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #52525b;
+}
+
+/* Light Theme Global Surface & Typography Mappings */
+:root:not(.dark) {
+  color-scheme: light;
+}
+
+:root:not(.dark) body {
+  background-color: #f8fafc;
+  color: #0f172a;
+}
+
+:root:not(.dark) .bg-zinc-950 {
+  background-color: #f1f5f9;
+}
+
+:root:not(.dark) .bg-zinc-950\/95,
+:root:not(.dark) .bg-zinc-950\/90,
+:root:not(.dark) .bg-zinc-950\/80,
+:root:not(.dark) .bg-zinc-950\/70,
+:root:not(.dark) .bg-zinc-950\/60,
+:root:not(.dark) .bg-zinc-950\/50,
+:root:not(.dark) .bg-zinc-950\/40,
+:root:not(.dark) .bg-zinc-950\/30 {
+  background-color: rgba(241, 245, 249, 0.95);
+}
+
+:root:not(.dark) .bg-zinc-900 {
+  background-color: #ffffff;
+}
+
+:root:not(.dark) .bg-zinc-900\/95,
+:root:not(.dark) .bg-zinc-900\/90,
+:root:not(.dark) .bg-zinc-900\/80 {
+  background-color: rgba(255, 255, 255, 0.96);
+}
+
+:root:not(.dark) .bg-zinc-800 {
+  background-color: #f8fafc;
+}
+
+:root:not(.dark) .bg-zinc-800\/80,
+:root:not(.dark) .bg-zinc-800\/50 {
+  background-color: rgba(248, 250, 252, 0.9);
+}
+
+:root:not(.dark) .hover\:bg-zinc-800:hover {
+  background-color: #f1f5f9;
+}
+
+:root:not(.dark) .border-zinc-800 {
+  border-color: #e2e8f0;
+}
+
+:root:not(.dark) .border-zinc-700 {
+  border-color: #cbd5e1;
+}
+
+:root:not(.dark) .border-zinc-700\/80,
+:root:not(.dark) .border-zinc-700\/60 {
+  border-color: rgba(203, 213, 225, 0.8);
+}
+
+:root:not(.dark) .text-zinc-100 {
+  color: #0f172a;
+}
+
+:root:not(.dark) .text-zinc-200 {
+  color: #1e293b;
+}
+
+:root:not(.dark) .text-zinc-300 {
+  color: #334155;
+}
+
+:root:not(.dark) .text-zinc-400 {
+  color: #64748b;
+}
+
+:root:not(.dark) .text-zinc-500 {
+  color: #64748b;
+}
+
+:root:not(.dark) .text-zinc-600 {
+  color: #475569;
+}
+
+:root:not(.dark) .bg-black\/75,
+:root:not(.dark) .bg-black\/80 {
+  background-color: rgba(15, 23, 42, 0.5);
+}
+
+:root:not(.dark) svg line[stroke="#27272a"] {
+  stroke: #e2e8f0;
+}
+
+:root:not(.dark) svg text[fill="#71717a"] {
+  fill: #64748b;
+}
+
+/* Print Media Styles */
+@media print {
+  @page {
+    size: landscape;
+    margin: 10mm;
+  }
+
+  html,
+  body {
+    background: #ffffff !important;
+    color: #000000 !important;
+    overflow: visible !important;
+    height: auto !important;
+    min-height: auto !important;
+  }
+
+  /* Hide app workspace and interactive chrome during print */
+  .print-hide,
+  .print\:hidden {
+    display: none !important;
+  }
+
+  /* Reset report modal backdrop */
+  .report-modal-backdrop {
+    position: static !important;
+    background: transparent !important;
+    backdrop-filter: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    display: block !important;
+    width: 100% !important;
+    height: auto !important;
+    min-height: auto !important;
+    overflow: visible !important;
+  }
+
+  .report-modal-container {
+    position: static !important;
+    border: none !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+    background: #ffffff !important;
+    color: #000000 !important;
+    max-width: 100% !important;
+    width: 100% !important;
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+    display: block !important;
+  }
+
+  .report-table-scroll {
+    overflow: visible !important;
+    height: auto !important;
+    max-height: none !important;
+    border: 1px solid #cbd5e1 !important;
+    box-shadow: none !important;
+  }
+
+  .report-table {
+    width: 100% !important;
+    min-width: 100% !important;
+    border-collapse: collapse !important;
+    page-break-inside: auto !important;
+  }
+
+  .report-table thead {
+    display: table-header-group !important;
+  }
+
+  .report-table thead th {
+    background-color: #f1f5f9 !important;
+    color: #0f172a !important;
+    border: 1px solid #94a3b8 !important;
+    font-size: 8.5pt !important;
+    padding: 5px 6px !important;
+  }
+
+  .report-table tbody tr {
+    page-break-inside: avoid !important;
+    page-break-after: auto !important;
+  }
+
+  .report-table tbody td {
+    border: 1px solid #cbd5e1 !important;
+    color: #0f172a !important;
+    background: transparent !important;
+    font-size: 8pt !important;
+    padding: 4px 6px !important;
+  }
+}

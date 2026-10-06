@@ -1,0 +1,6 @@
+{
+  "name": "ToneSmith - Electric Guitar Wiring Simulator & Audio Lab",
+  "description": "Real-time electric guitar pickup wiring simulator, interactive circuit canvas, live audio testing with microphone/DI, Bode frequency response, hum/phase analysis, and exportable schematics.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
