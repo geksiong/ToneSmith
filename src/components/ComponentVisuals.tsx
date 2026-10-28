@@ -136,6 +136,64 @@ function SolderLugTab({ x, y, title }: { x: number; y: number; title?: string })
     </div>
   );
 }
+export interface ResistorBandInfo {
+  hex: string;
+  name: string;
+}
+
+export const RESISTOR_COLOR_TABLE: Record<number, ResistorBandInfo> = {
+  0: { hex: '#18181b', name: 'Black' },
+  1: { hex: '#78350f', name: 'Brown' },
+  2: { hex: '#dc2626', name: 'Red' },
+  3: { hex: '#ea580c', name: 'Orange' },
+  4: { hex: '#facc15', name: 'Yellow' },
+  5: { hex: '#16a34a', name: 'Green' },
+  6: { hex: '#2563eb', name: 'Blue' },
+  7: { hex: '#9333ea', name: 'Violet' },
+  8: { hex: '#64748b', name: 'Gray' },
+  9: { hex: '#f8fafc', name: 'White' },
+};
+
+export function getResistorBands(resistanceOhms: number) {
+  const ohms = Math.max(1, Math.round(resistanceOhms || 150000));
+  const exp = Math.floor(Math.log10(ohms));
+  const normalized = ohms / Math.pow(10, exp);
+  const twoDigits = Math.round(normalized * 10);
+
+  let d1 = Math.floor(twoDigits / 10);
+  let d2 = twoDigits % 10;
+  let multExp = exp - 1;
+
+  if (d1 >= 10) {
+    d1 = 1;
+    d2 = 0;
+    multExp += 1;
+  }
+
+  const band1 = RESISTOR_COLOR_TABLE[d1] || { hex: '#78350f', name: 'Brown' };
+  const band2 = RESISTOR_COLOR_TABLE[d2] || { hex: '#18181b', name: 'Black' };
+
+  let multiplier: ResistorBandInfo;
+  if (multExp === -1) {
+    multiplier = { hex: '#d4af37', name: 'Gold' };
+  } else if (multExp === -2) {
+    multiplier = { hex: '#cbd5e1', name: 'Silver' };
+  } else {
+    multiplier = RESISTOR_COLOR_TABLE[Math.max(0, Math.min(9, multExp))] || { hex: '#18181b', name: 'Black' };
+  }
+
+  const tolerance: ResistorBandInfo = { hex: '#d4af37', name: 'Gold (±5%)' };
+
+  return {
+    band1,
+    band2,
+    multiplier,
+    tolerance,
+    ohms,
+    formatted: ohms >= 1000000 ? `${ohms / 1000000}MΩ` : ohms >= 1000 ? `${ohms / 1000}kΩ` : `${ohms}Ω`,
+    colorSummary: `${band1.name} · ${band2.name} · ${multiplier.name} · Gold`,
+  };
+}
 
 function renderVisualBody(
   comp: CircuitComponent,
@@ -1124,32 +1182,126 @@ function renderVisualBody(
     }
 
     case 'capacitor': {
+      const capType: 'orange-drop' | 'paper-in-oil' | 'ceramic-disc' = properties.capType || 'orange-drop';
+      const uF = properties.capacitanceUf ?? 0.022;
+
       return (
-        <div className="w-full h-full bg-gradient-to-r from-amber-600 via-amber-500 to-amber-700 rounded-full border border-amber-300 flex items-center justify-center shadow-lg p-1">
-          <div className="flex flex-col items-center justify-center pointer-events-none">
-            <span className="text-[8.5px] font-mono font-bold text-zinc-950 tracking-tight leading-none">
-              {properties.capacitanceUf ?? 0.022}µF
-            </span>
-            <span className="text-[6.5px] font-mono font-semibold text-zinc-900 leading-none mt-0.5">
-              715P 200V
-            </span>
-          </div>
+        <div className="w-full h-full relative flex items-center justify-center select-none">
+          {/* Silver Lead Wires connecting to solder lugs (x: 15 to x: 85) */}
+          <div className="absolute top-[25px] left-[15px] right-[15px] h-[2px] -translate-y-1/2 bg-gradient-to-r from-stone-400 via-stone-300 to-stone-400 rounded-full pointer-events-none" />
+
+          {/* 1. CERAMIC DISC */}
+          {capType === 'ceramic-disc' && (
+            <div
+              className="relative z-5 w-[44px] h-[44px] rounded-full bg-gradient-to-br from-amber-200 via-amber-300 to-amber-500 border-2 border-amber-600 shadow-md flex flex-col items-center justify-center p-0.5"
+              title={`Ceramic Disc Capacitor: ${uF < 0.01 ? `${Math.round(uF * 1000000)}pF` : `${uF}µF`}`}
+            >
+              <span className="text-[9.5px] font-mono font-black text-amber-950 tracking-tight leading-none pointer-events-none">
+                {uF < 0.01 ? '102' : uF === 0.047 ? '473' : '223'}
+              </span>
+              <span className="text-[6.5px] font-mono font-bold text-amber-900 leading-none mt-0.5 pointer-events-none">
+                {uF < 0.01 ? `${Math.round(uF * 1000000)}pF` : `${uF}µF`}
+              </span>
+            </div>
+          )}
+
+          {/* 2. PAPER-IN-OIL / 1959 BUMBLEBEE */}
+          {capType === 'paper-in-oil' && (
+            <div
+              className="relative z-5 w-[76px] h-[28px] rounded-full bg-gradient-to-b from-[#2e2b28] via-[#1a1716] to-[#0a0908] border border-stone-600 shadow-md flex items-center justify-between px-2 overflow-hidden"
+              title={`1959 Bumblebee Paper-in-Oil (PIO) Capacitor: ${uF}µF 400V`}
+            >
+              {/* Bumblebee Authentic Color Bands (Red, Red, Orange, Black, Yellow for 0.022µF 400V) */}
+              <div className="flex items-center gap-1 h-full py-1 pointer-events-none">
+                <div className="w-[3px] h-full bg-red-600 shadow-xs" title="2 (Red)" />
+                <div className="w-[3px] h-full bg-red-600 shadow-xs" title="2 (Red)" />
+                <div className="w-[3px] h-full bg-orange-500 shadow-xs" title="10^3 (Orange)" />
+                <div className="w-[3px] h-full bg-stone-900 border-x border-stone-700 shadow-xs" title="Tolerance 20% (Black)" />
+                <div className="w-[3px] h-full bg-yellow-400 shadow-xs" title="400V (Yellow)" />
+              </div>
+              <div className="flex flex-col items-end pointer-events-none pr-1">
+                <span className="text-[8px] font-mono font-bold text-amber-400 tracking-tight leading-none">
+                  {uF}µF
+                </span>
+                <span className="text-[6px] font-mono text-stone-400 leading-none mt-0.5">
+                  PIO 400V
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* 3. SPRAGUE ORANGE DROP 715P */}
+          {capType === 'orange-drop' && (
+            <div
+              className="relative z-5 w-[76px] h-[36px] rounded-2xl bg-gradient-to-b from-[#ff8833] via-[#ff6600] to-[#e65100] border-2 border-[#ffaa66] shadow-lg shadow-orange-500/35 flex flex-col items-center justify-center p-1 overflow-hidden"
+              title={`Sprague 715P Orange Drop Capacitor: ${uF}µF 200V`}
+            >
+              {/* Top Gloss Highlight */}
+              <div className="w-[52px] h-[2.5px] rounded-full bg-white/50 blur-[0.3px] -mt-0.5 mb-0.5 pointer-events-none" />
+
+              {/* Crisp High-Contrast Markings */}
+              <span className="text-[10.5px] font-mono font-black text-stone-950 tracking-tight leading-none drop-shadow-[0_1px_0_rgba(255,255,255,0.25)] pointer-events-none">
+                {uF}µF
+              </span>
+              <span className="text-[7px] font-mono font-bold text-stone-900 leading-none mt-0.5 tracking-wider pointer-events-none">
+                715P 200V SBE
+              </span>
+            </div>
+          )}
         </div>
       );
     }
 
     case 'resistor': {
+      const ohms = properties.resistanceOhms ?? 150000;
+      const bands = getResistorBands(ohms);
+
       return (
-        <div className="w-full h-full bg-amber-100 rounded-full border border-amber-300 flex items-center justify-center shadow-sm p-1">
-          <div className="flex items-center gap-1 pointer-events-none">
-            <div className="w-1.5 h-3 bg-amber-800 rounded-xs" />
-            <div className="w-1.5 h-3 bg-green-700 rounded-xs" />
-            <div className="w-1.5 h-3 bg-amber-500 rounded-xs" />
-            <div className="w-1.5 h-3 bg-amber-300 rounded-xs" />
-            <span className="text-[7.5px] font-mono font-bold text-zinc-900 ml-1">
-              {Math.round((properties.resistanceOhms ?? 150000) / 1000)}kΩ
-            </span>
+        <div
+          className="w-full h-full relative flex items-center justify-center select-none"
+          title={`Resistor: ${bands.formatted} (EIA Color Bands: ${bands.colorSummary})`}
+        >
+          {/* Silver Axial Lead Wires connecting to solder lugs (x: 12 to x: 78) */}
+          <div className="absolute top-[20px] left-[12px] right-[12px] h-[2px] -translate-y-1/2 bg-gradient-to-r from-stone-400 via-stone-300 to-stone-400 rounded-full" />
+
+          {/* Resistor Body with Accurate Resistance Color Bands */}
+          <div className="relative z-10 w-[56px] h-[22px] rounded-full bg-gradient-to-b from-[#f7eedc] via-[#ecdfc4] to-[#dfceaa] dark:from-[#f3e7cf] dark:via-[#e7d5b4] dark:to-[#d6bc90] border border-[#a89069] shadow-md flex items-center justify-between px-2 overflow-hidden">
+            {/* Color Band 1 (1st Significant Digit) */}
+            <div
+              className="w-[4.5px] h-full shadow-xs shrink-0"
+              style={{ backgroundColor: bands.band1.hex }}
+              title={`Band 1: ${bands.band1.name}`}
+            />
+
+            {/* Color Band 2 (2nd Significant Digit) */}
+            <div
+              className="w-[4.5px] h-full shadow-xs shrink-0"
+              style={{ backgroundColor: bands.band2.hex }}
+              title={`Band 2: ${bands.band2.name}`}
+            />
+
+            {/* Color Band 3 (Multiplier) */}
+            <div
+              className="w-[4.5px] h-full shadow-xs shrink-0"
+              style={{ backgroundColor: bands.multiplier.hex }}
+              title={`Multiplier: ${bands.multiplier.name}`}
+            />
+
+            {/* Spacer between multiplier and tolerance */}
+            <div className="w-[5px] shrink-0" />
+
+            {/* Color Band 4 (Tolerance - Gold ±5%) */}
+            <div
+              className="w-[4.5px] h-full shadow-xs shrink-0 border-y border-amber-300/40"
+              style={{ backgroundColor: bands.tolerance.hex }}
+              title={`Tolerance: ${bands.tolerance.name}`}
+            />
           </div>
+
+          {/* Resistance Value Label Tag */}
+          <span className="absolute -bottom-2.5 left-1/2 -translate-x-1/2 text-[8px] font-mono font-bold text-stone-800 dark:text-stone-200 bg-white/95 dark:bg-stone-900/95 px-1 rounded border border-stone-300 dark:border-stone-700 shadow-xs pointer-events-none whitespace-nowrap">
+            {bands.formatted}
+          </span>
         </div>
       );
     }

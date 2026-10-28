@@ -351,9 +351,9 @@ export default function App() {
   }, [state]);
 
   return (
-    <div className="flex flex-col h-screen w-screen overflow-hidden bg-zinc-100 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 font-sans transition-colors duration-150 print:h-auto print:w-auto print:overflow-visible print:bg-white">
-      {/* Top Main Toolbar */}
-      <div className="print:hidden">
+    <div className="flex flex-col h-screen w-screen overflow-hidden bg-stone-100 dark:bg-[#121110] text-stone-900 dark:text-stone-100 font-sans transition-colors duration-150 print:h-auto print:w-auto print:overflow-visible print:bg-white">
+      {/* Top Main Toolbar with high stacking context */}
+      <div className="relative z-50 shrink-0 print:hidden">
         <Toolbar
           canUndo={canUndo}
           canRedo={canRedo}
@@ -375,6 +375,7 @@ export default function App() {
             }
           }}
           onOpenPresets={() => setIsPresetsOpen(true)}
+          onSelectPresetDirect={handleSelectPreset}
           onOpenExport={() => setIsExportOpen(true)}
           onOpenAnalysisReport={() => setIsAnalysisReportOpen(true)}
           onOpenNotes={() => {
@@ -396,6 +397,7 @@ export default function App() {
           onToggleSignalPath={handleToggleSignalPath}
           theme={theme}
           onToggleTheme={toggleTheme}
+          onOpenHelp={() => setShowHelp(true)}
         />
       </div>
 
@@ -410,7 +412,7 @@ export default function App() {
         />
 
         {/* CENTER: Interactive Circuit Board & Cavity Canvas */}
-        <div className="flex-1 h-full relative overflow-hidden">
+        <div className="flex-1 h-full relative overflow-hidden bg-stone-100 dark:bg-[#141210]">
           <Canvas
             state={state}
             selectedComponentId={selectedComponentId}
@@ -448,59 +450,71 @@ export default function App() {
             theme={theme}
           />
 
-          {/* Quick Help Floating Button */}
-          <button
-            type="button"
-            onClick={() => setShowHelp((prev) => !prev)}
-            className="absolute top-4 right-4 z-20 p-2 rounded-full bg-white dark:bg-zinc-900/90 border border-zinc-300 dark:border-zinc-700/80 text-zinc-700 dark:text-zinc-400 hover:text-zinc-950 dark:hover:text-white backdrop-blur shadow-lg transition-all"
-            title="How to wire & test"
-          >
-            <HelpCircle className="w-5 h-5" />
-          </button>
-
-          {/* Help Popover */}
+          {/* Clean Quick Help Modal */}
           {showHelp && (
-            <div className="absolute top-16 right-4 z-30 w-80 p-3.5 bg-white dark:bg-zinc-900/95 border border-zinc-300 dark:border-zinc-700 rounded-xl shadow-2xl backdrop-blur font-mono text-xs text-zinc-800 dark:text-zinc-300 flex flex-col gap-2">
-              <div className="flex items-center justify-between border-b border-zinc-200 dark:border-zinc-800 pb-1.5 font-bold text-amber-700 dark:text-amber-400">
-                <span>QUICK WIRING GUIDE</span>
-                <button
-                  type="button"
-                  onClick={() => setShowHelp(false)}
-                  className="text-zinc-500 hover:text-zinc-950 dark:hover:text-zinc-200"
-                >
-                  ✕
-                </button>
+            <div
+              className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs animate-in fade-in duration-150"
+              onClick={() => setShowHelp(false)}
+            >
+              <div
+                className="w-full max-w-lg p-5 bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 rounded-2xl shadow-2xl font-mono text-xs text-stone-800 dark:text-stone-300 flex flex-col gap-3"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="flex items-center justify-between border-b border-stone-200 dark:border-stone-800 pb-2">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-amber-500" />
+                    <span className="font-bold text-amber-700 dark:text-amber-400 tracking-wider">
+                      LUTHIER WORKBENCH QUICK GUIDE
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowHelp(false)}
+                    className="p-1 rounded text-stone-400 hover:text-stone-900 dark:hover:text-stone-100 hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+                <ul className="space-y-2 text-xs list-disc list-inside text-stone-700 dark:text-stone-300 font-sans leading-relaxed">
+                  <li><strong className="font-mono text-stone-950 dark:text-stone-100">Add Components:</strong> Search or click any component from the left palette to drop it into the guitar cavity.</li>
+                  <li><strong className="font-mono text-stone-950 dark:text-stone-100">Wiring Terminals:</strong> Click on any solder lug, then click the destination lug to route a vintage cloth wire.</li>
+                  <li><strong className="font-mono text-stone-950 dark:text-stone-100">Change Wire Color:</strong> Click any wire to open the inline swatch palette and change cloth colors.</li>
+                  <li><strong className="font-mono text-stone-950 dark:text-stone-100">Interactive Knobs:</strong> Turn pot shafts, flip blade/toggle switches, or pull up push-pull pots in real time.</li>
+                  <li><strong className="font-mono text-stone-950 dark:text-stone-100">Audio Testing:</strong> Open the <span className="font-mono text-amber-600 dark:text-amber-400 font-bold">Audio Lab</span> tab on the right to audition clean DI strat loops, blues riffs, or your live microphone.</li>
+                  <li><strong className="font-mono text-stone-950 dark:text-stone-100">Bode Analysis:</strong> Switch to the <span className="font-mono text-amber-600 dark:text-amber-400 font-bold">Bode</span> tab to see live resonant frequency peaks and high-frequency roll-off curves.</li>
+                  <li><strong className="font-mono text-stone-950 dark:text-stone-100">Signal Path Trace:</strong> Toggle the Signal Path tool in the bottom dock to illuminate the active signal route to the output jack.</li>
+                </ul>
+                <div className="pt-2 border-t border-stone-200 dark:border-stone-800 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setShowHelp(false)}
+                    className="px-4 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-stone-950 font-bold text-xs font-mono transition-colors"
+                  >
+                    Got it
+                  </button>
+                </div>
               </div>
-              <ul className="space-y-1.5 text-[11px] list-disc list-inside text-zinc-700 dark:text-zinc-400">
-                <li><strong className="text-zinc-950 dark:text-zinc-200">Add Parts:</strong> Click any component in the left palette to add it.</li>
-                <li><strong className="text-zinc-950 dark:text-zinc-200">Connect wires:</strong> Click on any terminal/lug, then click on the target lug to snap a wire.</li>
-                <li><strong className="text-zinc-950 dark:text-zinc-200">Interactive controls:</strong> Turn pot knobs, flick 3-way/5-way switches, or click Push-Pull shafts directly!</li>
-                <li><strong className="text-zinc-950 dark:text-zinc-200">Flip Magnet:</strong> Click the "MAG" button on Humbuckers to hear the Peter Green out-of-phase blues tone!</li>
-                <li><strong className="text-zinc-950 dark:text-zinc-200">Audio test:</strong> Turn on your Microphone or play the clean DI looper in the right Audio Lab panel.</li>
-                <li><strong className="text-zinc-950 dark:text-zinc-200">Signal Path Trace:</strong> Toggle the "Signal Path" button to highlight active wires and parts delivering pickup sound to the jack, while dimming inactive parts (pots at zero stay active).</li>
-                <li><strong className="text-zinc-950 dark:text-zinc-200">Collapsible Panels:</strong> Use the toggle buttons on the sidebars to maximize cavity canvas space.</li>
-              </ul>
             </div>
           )}
         </div>
 
         {/* RIGHT SIDE: Collapsible Real-Time Circuit Analysis & Audio Lab */}
         {isRightCollapsed ? (
-          <aside className="w-12 h-full border-l border-zinc-300 dark:border-zinc-800 bg-white dark:bg-zinc-900/95 backdrop-blur flex flex-col items-center py-3 z-20 shrink-0 shadow-xl select-none transition-all">
+          <aside className="w-12 h-full border-l border-stone-200 dark:border-stone-800/80 bg-white/95 dark:bg-[#151210]/95 backdrop-blur flex flex-col items-center py-3 z-20 shrink-0 shadow-lg select-none transition-all">
             {/* Expand button */}
             <button
               type="button"
               onClick={() => setIsRightCollapsed(false)}
               title="Expand Analysis & Audio Lab"
-              className="p-2 rounded-lg bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-amber-600 dark:text-amber-400 hover:text-amber-700 dark:hover:text-amber-300 transition-all shadow-sm"
+              className="p-2 rounded-lg bg-stone-100 hover:bg-stone-200 dark:bg-stone-800/80 dark:hover:bg-stone-700 text-amber-600 dark:text-amber-400 transition-colors shadow-xs"
             >
               <PanelRightOpen className="w-4 h-4" />
             </button>
 
-            <div className="w-6 h-[1px] bg-zinc-300 dark:bg-zinc-800 my-3" />
+            <div className="w-5 h-[1px] bg-stone-200 dark:bg-stone-800 my-3" />
 
             {/* Quick status icons */}
-            <div className="flex flex-col gap-3 items-center">
+            <div className="flex flex-col gap-2.5 items-center">
               <button
                 type="button"
                 onClick={() => {
@@ -508,7 +522,11 @@ export default function App() {
                   setIsRightCollapsed(false);
                 }}
                 title="Analysis"
-                className="p-2 rounded-lg text-emerald-700 dark:text-emerald-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-all"
+                className={`p-2 rounded-lg transition-colors ${
+                  rightTab === 'overview'
+                    ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+                    : 'text-stone-500 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800'
+                }`}
               >
                 <Activity className="w-4 h-4" />
               </button>
@@ -520,7 +538,11 @@ export default function App() {
                   setIsRightCollapsed(false);
                 }}
                 title="Bode Plot"
-                className="p-2 rounded-lg text-amber-600 dark:text-amber-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-all"
+                className={`p-2 rounded-lg transition-colors ${
+                  rightTab === 'frequency'
+                    ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+                    : 'text-stone-500 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800'
+                }`}
               >
                 <BarChart3 className="w-4 h-4" />
               </button>
@@ -532,7 +554,11 @@ export default function App() {
                   setIsRightCollapsed(false);
                 }}
                 title="Audio Lab"
-                className="p-2 rounded-lg text-rose-600 dark:text-rose-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-all cursor-pointer"
+                className={`p-2 rounded-lg transition-colors ${
+                  rightTab === 'audio'
+                    ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+                    : 'text-stone-500 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800'
+                }`}
               >
                 <Volume2 className="w-4 h-4" />
               </button>
@@ -544,10 +570,10 @@ export default function App() {
                   setIsRightCollapsed(false);
                 }}
                 title="Technician Notes"
-                className={`p-2 rounded-lg transition-all cursor-pointer ${
+                className={`p-2 rounded-lg transition-colors ${
                   rightTab === 'notes'
-                    ? 'text-amber-500 bg-amber-500/10'
-                    : 'text-amber-600 dark:text-amber-400 hover:bg-zinc-100 dark:hover:bg-zinc-800'
+                    ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+                    : 'text-stone-500 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800'
                 }`}
               >
                 <FileEdit className="w-4 h-4" />
@@ -555,33 +581,34 @@ export default function App() {
             </div>
 
             {/* Signal Active Indicator Dot */}
-            <div className="my-auto flex flex-col items-center gap-1.5">
+            <div className="mt-auto py-3 flex flex-col items-center gap-1.5">
               <span
                 className={`w-2 h-2 rounded-full ${
-                  analysis.hasOutputSignal ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'
+                  analysis.hasOutputSignal ? 'bg-emerald-500' : 'bg-rose-500'
                 }`}
+                title={analysis.hasOutputSignal ? 'Circuit complete: Signal reaching output jack' : 'Open circuit: No signal'}
               />
               <span
-                className="text-[9px] font-mono text-zinc-600 dark:text-zinc-500 tracking-widest uppercase cursor-pointer hover:text-zinc-950 dark:hover:text-zinc-300"
+                className="text-[9px] font-mono text-stone-400 tracking-widest uppercase cursor-pointer hover:text-stone-700 dark:hover:text-stone-300"
                 style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
                 onClick={() => setIsRightCollapsed(false)}
               >
-                CIRCUIT ANALYSIS
+                INSPECTOR
               </span>
             </div>
           </aside>
         ) : (
-          <aside className="w-[460px] h-full border-l border-zinc-300 dark:border-zinc-800 bg-zinc-50/95 dark:bg-zinc-900/95 backdrop-blur flex flex-col z-20 shrink-0 shadow-2xl overflow-hidden transition-all">
+          <aside className="w-[450px] xl:w-[470px] h-full border-l border-stone-200 dark:border-stone-800/80 bg-white/95 dark:bg-[#161311]/95 backdrop-blur flex flex-col z-20 shrink-0 select-none shadow-xl overflow-hidden transition-all">
             {/* Right Header with Filter Tabs and Collapse Button */}
-            <div className="flex items-center justify-between border-b border-zinc-300 dark:border-zinc-800 p-2 bg-white dark:bg-zinc-950/60 gap-1.5">
+            <div className="flex items-center justify-between border-b border-stone-200 dark:border-stone-800/80 p-2 bg-stone-50 dark:bg-stone-950/40 gap-1">
               <div className="flex items-center gap-1 flex-1 overflow-x-auto">
                 <button
                   type="button"
                   onClick={() => setRightTab('overview')}
-                  className={`flex-1 flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg text-xs font-mono transition-all cursor-pointer whitespace-nowrap ${
+                  className={`flex-1 flex items-center justify-center gap-1 py-1 px-2 rounded-md text-xs font-mono transition-colors cursor-pointer whitespace-nowrap ${
                     rightTab === 'overview'
-                      ? 'bg-amber-500 text-zinc-950 font-bold shadow-md shadow-amber-500/20'
-                      : 'text-zinc-700 dark:text-zinc-400 hover:text-zinc-950 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-800/80 font-medium'
+                      ? 'bg-white dark:bg-stone-800 text-stone-950 dark:text-white font-bold shadow-xs'
+                      : 'text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
                   }`}
                 >
                   <Activity className="w-3.5 h-3.5" />
@@ -591,10 +618,10 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setRightTab('frequency')}
-                  className={`flex-1 flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg text-xs font-mono transition-all cursor-pointer whitespace-nowrap ${
+                  className={`flex-1 flex items-center justify-center gap-1 py-1 px-2 rounded-md text-xs font-mono transition-colors cursor-pointer whitespace-nowrap ${
                     rightTab === 'frequency'
-                      ? 'bg-amber-500 text-zinc-950 font-bold shadow-md shadow-amber-500/20'
-                      : 'text-zinc-700 dark:text-zinc-400 hover:text-zinc-950 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-800/80 font-medium'
+                      ? 'bg-white dark:bg-stone-800 text-stone-950 dark:text-white font-bold shadow-xs'
+                      : 'text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
                   }`}
                 >
                   <BarChart3 className="w-3.5 h-3.5" />
@@ -604,10 +631,10 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setRightTab('audio')}
-                  className={`flex-1 flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg text-xs font-mono transition-all cursor-pointer whitespace-nowrap ${
+                  className={`flex-1 flex items-center justify-center gap-1 py-1 px-2 rounded-md text-xs font-mono transition-colors cursor-pointer whitespace-nowrap ${
                     rightTab === 'audio'
-                      ? 'bg-amber-500 text-zinc-950 font-bold shadow-md shadow-amber-500/20'
-                      : 'text-zinc-700 dark:text-zinc-400 hover:text-zinc-950 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-800/80 font-medium'
+                      ? 'bg-white dark:bg-stone-800 text-stone-950 dark:text-white font-bold shadow-xs'
+                      : 'text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
                   }`}
                 >
                   <Volume2 className="w-3.5 h-3.5" />
@@ -617,10 +644,10 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setRightTab('notes')}
-                  className={`flex-1 flex items-center justify-center gap-1 py-1.5 px-2 rounded-lg text-xs font-mono transition-all cursor-pointer whitespace-nowrap ${
+                  className={`flex-1 flex items-center justify-center gap-1 py-1 px-2 rounded-md text-xs font-mono transition-colors cursor-pointer whitespace-nowrap ${
                     rightTab === 'notes'
-                      ? 'bg-amber-500 text-zinc-950 font-bold shadow-md shadow-amber-500/20'
-                      : 'text-zinc-700 dark:text-zinc-400 hover:text-zinc-950 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-800/80 font-medium'
+                      ? 'bg-white dark:bg-stone-800 text-stone-950 dark:text-white font-bold shadow-xs'
+                      : 'text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-200'
                   }`}
                 >
                   <FileEdit className="w-3.5 h-3.5" />
@@ -632,37 +659,25 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setIsRightCollapsed(true)}
-                title="Collapse Analysis & Audio Lab"
-                className="p-1.5 rounded-lg text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-white hover:bg-zinc-200 dark:hover:bg-zinc-800 transition-colors cursor-pointer shrink-0"
+                title="Collapse Panel"
+                className="p-1 rounded-md text-stone-400 hover:text-stone-700 dark:hover:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors cursor-pointer shrink-0"
               >
-                <PanelRightClose className="w-4 h-4" />
+                <PanelRightClose className="w-3.5 h-3.5" />
               </button>
             </div>
 
-            {/* Right Tab Content */}
+            {/* Right Tab Content - Focused Single-View Per Active Tab */}
             <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-3">
               {rightTab === 'overview' && (
-                <>
-                  <CircuitAnalyzer analysis={analysis} onOpenReport={() => setIsAnalysisReportOpen(true)} />
-                  <FrequencyResponsePlot analysis={analysis} />
-                  <AudioPanel analysis={analysis} />
-                </>
+                <CircuitAnalyzer analysis={analysis} onOpenReport={() => setIsAnalysisReportOpen(true)} />
               )}
 
               {rightTab === 'frequency' && (
-                <>
-                  <FrequencyResponsePlot analysis={analysis} />
-                  <CircuitAnalyzer analysis={analysis} onOpenReport={() => setIsAnalysisReportOpen(true)} />
-                  <AudioPanel analysis={analysis} />
-                </>
+                <FrequencyResponsePlot analysis={analysis} />
               )}
 
               {rightTab === 'audio' && (
-                <>
-                  <AudioPanel analysis={analysis} />
-                  <CircuitAnalyzer analysis={analysis} onOpenReport={() => setIsAnalysisReportOpen(true)} />
-                  <FrequencyResponsePlot analysis={analysis} />
-                </>
+                <AudioPanel analysis={analysis} />
               )}
 
               {rightTab === 'notes' && (

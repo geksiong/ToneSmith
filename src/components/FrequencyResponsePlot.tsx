@@ -6,7 +6,15 @@ interface FrequencyPlotProps {
 }
 
 export const FrequencyResponsePlot: React.FC<FrequencyPlotProps> = ({ analysis }) => {
-  const [hoverData, setHoverData] = useState<{ freq: number; db: number; x: number; y: number } | null>(null);
+  const [hoverData, setHoverData] = useState<{
+    freq: number;
+    db: number;
+    svgX: number;
+    svgY: number;
+    screenX: number;
+    screenY: number;
+    containerWidth: number;
+  } | null>(null);
 
   const width = 440;
   const height = 150;
@@ -157,11 +165,30 @@ export const FrequencyResponsePlot: React.FC<FrequencyPlotProps> = ({ analysis }
 
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    const mouseX = e.clientX - rect.left;
-    if (mouseX >= padding.left && mouseX <= padding.left + plotW) {
-      const f = Math.round(xToFreq(mouseX));
+    if (!rect.width || !rect.height) return;
+
+    const screenX = e.clientX - rect.left;
+    const screenY = e.clientY - rect.top;
+
+    // Convert screen coordinates to SVG viewBox coordinate space (0..width, 0..height)
+    const svgX = (screenX / rect.width) * width;
+
+    if (svgX >= padding.left && svgX <= padding.left + plotW) {
+      const f = Math.round(xToFreq(svgX));
       const db = Math.round(calculateGainAtFreq(f) * 10) / 10;
-      setHoverData({ freq: f, db, x: mouseX, y: dbToY(db) });
+      const svgY = dbToY(db);
+
+      setHoverData({
+        freq: f,
+        db,
+        svgX,
+        svgY,
+        screenX,
+        screenY,
+        containerWidth: rect.width,
+      });
+    } else {
+      setHoverData(null);
     }
   };
 
@@ -323,38 +350,45 @@ export const FrequencyResponsePlot: React.FC<FrequencyPlotProps> = ({ analysis }
           {hoverData && (
             <g>
               <line
-                x1={hoverData.x}
+                x1={hoverData.svgX}
                 y1={padding.top}
-                x2={hoverData.x}
+                x2={hoverData.svgX}
                 y2={padding.top + plotH}
-                stroke="#71717a"
-                strokeWidth="1"
+                stroke="#a1a1aa"
+                strokeWidth="1.2"
+                strokeDasharray="2 2"
               />
               <circle
-                cx={hoverData.x}
-                cy={hoverData.y}
+                cx={hoverData.svgX}
+                cy={hoverData.svgY}
                 r="4"
                 fill="#ffffff"
-                stroke="#d97706"
+                stroke={strokeColor}
                 strokeWidth="2"
               />
             </g>
           )}
         </svg>
 
-        {/* Floating Tooltip */}
+        {/* Floating Tooltip following mouse pointer */}
         {hoverData && (
           <div
-            className="absolute px-2 py-1 bg-zinc-950/95 border border-zinc-700 rounded text-[10px] font-mono pointer-events-none z-30 shadow-xl text-zinc-100"
+            className="absolute px-2 py-1 bg-zinc-950/95 dark:bg-zinc-900/95 border border-zinc-700/80 rounded-md text-[10px] font-mono pointer-events-none z-30 shadow-xl text-zinc-100 whitespace-nowrap flex items-center gap-1.5"
             style={{
-              left: Math.min(width - 100, Math.max(10, hoverData.x - 40)),
-              top: Math.max(0, hoverData.y - 30),
+              left: `${Math.max(50, Math.min(hoverData.containerWidth - 50, hoverData.screenX))}px`,
+              top: `${hoverData.screenY < 38 ? hoverData.screenY + 16 : hoverData.screenY - 32}px`,
+              transform: 'translateX(-50%)',
             }}
           >
-            {hoverData.freq >= 1000
-              ? `${(hoverData.freq / 1000).toFixed(2)} kHz`
-              : `${hoverData.freq} Hz`}
-            : <span className="text-amber-400 font-bold">{hoverData.db > 0 ? `+${hoverData.db}` : hoverData.db} dB</span>
+            <span className="font-bold text-zinc-200">
+              {hoverData.freq >= 1000
+                ? `${(hoverData.freq / 1000).toFixed(2)} kHz`
+                : `${hoverData.freq} Hz`}
+            </span>
+            <span className="text-zinc-500">·</span>
+            <span className={`font-black ${hoverData.db >= 0 ? 'text-amber-400' : 'text-zinc-300'}`}>
+              {hoverData.db > 0 ? `+${hoverData.db}` : hoverData.db} dB
+            </span>
           </div>
         )}
       </div>

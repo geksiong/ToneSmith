@@ -1,24 +1,29 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { Wire, WireColor } from '../types/guitar';
-import { WIRE_COLOR_OPTIONS, getWireColorLabel } from '../lib/colorCodes';
+import { Wire, WireColor, WiringPreset } from '../types/guitar';
+import { WIRING_PRESETS } from '../lib/presets';
 import { guitarAudio } from '../lib/audioEngine';
 import {
-  Undo,
-  Redo,
+  Undo2,
+  Redo2,
   Trash2,
   Download,
   BookOpen,
   FolderOpen,
   RotateCcw,
-  Zap,
-  Palette,
-  Check,
   Sun,
   Moon,
   Square,
   FileSpreadsheet,
   HelpCircle,
   FileEdit,
+  ChevronDown,
+  Printer,
+  Sparkles,
+  Zap,
+  Sliders,
+  Check,
+  Compass,
+  Palette,
 } from 'lucide-react';
 
 interface ToolbarProps {
@@ -29,6 +34,7 @@ interface ToolbarProps {
   activeWireColor: WireColor;
   onSelectWireColor: (color: WireColor) => void;
   onOpenPresets: () => void;
+  onSelectPresetDirect?: (preset: WiringPreset) => void;
   onOpenExport: () => void;
   onOpenAnalysisReport?: () => void;
   onOpenNotes?: () => void;
@@ -47,6 +53,8 @@ interface ToolbarProps {
   onToggleSignalPath?: () => void;
   theme?: 'dark' | 'light';
   onToggleTheme?: () => void;
+  onResetView?: () => void;
+  onOpenHelp?: () => void;
 }
 
 export const Toolbar: React.FC<ToolbarProps> = ({
@@ -57,6 +65,7 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   activeWireColor,
   onSelectWireColor,
   onOpenPresets,
+  onSelectPresetDirect,
   onOpenExport,
   onOpenAnalysisReport,
   onOpenNotes,
@@ -67,30 +76,44 @@ export const Toolbar: React.FC<ToolbarProps> = ({
   selectedWireId,
   selectedWire,
   onDeleteSelected,
-  onEditSelectedComponent,
-  onChangeSelectedWireColor,
   isInteractiveMode = false,
   onToggleInteractiveMode,
   showSignalPath = false,
   onToggleSignalPath,
   theme = 'dark',
   onToggleTheme,
+  onResetView,
+  onOpenHelp,
 }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [isAudioPlaying, setIsAudioPlaying] = useState(() => guitarAudio.isRiffPlaying);
+  const [openMenu, setOpenMenu] = useState<'file' | 'presets' | 'tools' | 'view' | null>(null);
+  const menuContainerRef = useRef<HTMLDivElement>(null);
 
+  // Subscribe to audio state
   useEffect(() => {
     return guitarAudio.subscribe(() => {
       setIsAudioPlaying(guitarAudio.isRiffPlaying);
     });
   }, []);
 
-  const handleSelectColor = (color: WireColor) => {
-    onSelectWireColor(color);
-    if (selectedWireId && onChangeSelectedWireColor) {
-      onChangeSelectedWireColor(color);
-    }
-  };
+  // Close menus on outside click or Escape
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (menuContainerRef.current && !menuContainerRef.current.contains(e.target as Node)) {
+        setOpenMenu(null);
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpenMenu(null);
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, []);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -104,49 +127,328 @@ export const Toolbar: React.FC<ToolbarProps> = ({
     };
     reader.readAsText(file);
     e.target.value = '';
+    setOpenMenu(null);
   };
 
+  const handlePrint = () => {
+    setOpenMenu(null);
+    window.print();
+  };
+
+  const toggleMenu = (menu: 'file' | 'presets' | 'tools' | 'view') => {
+    setOpenMenu((prev) => (prev === menu ? null : menu));
+  };
+
+  // Popular quick presets for the dropdown menu
+  const quickPresets = WIRING_PRESETS.slice(0, 7);
+
   return (
-    <header className="h-14 border-b border-zinc-300 dark:border-zinc-800 bg-white dark:bg-zinc-900/95 backdrop-blur px-4 flex items-center justify-between select-none z-30 transition-colors duration-150 shadow-xs">
-      {/* Brand & Title */}
-      <div className="flex items-center gap-3">
-        <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center shadow-md shadow-amber-500/20 text-zinc-950 font-black">
-            <Zap className="w-5 h-5 fill-current" />
+    <header className="h-13 border-b border-stone-200 dark:border-stone-800/80 bg-white/95 dark:bg-[#151210]/95 backdrop-blur px-4 flex items-center justify-between select-none relative z-50 transition-colors shadow-xs">
+      {/* ZONE 1: Brand & Luthier Wordmark */}
+      <div className="flex items-center gap-6 shrink-0">
+        <div className="flex items-center gap-2.5">
+          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center shadow-md shadow-amber-500/20 text-stone-950 font-black">
+            <Zap className="w-4 h-4 fill-current" />
           </div>
-          <div>
-            <div className="flex items-center gap-1.5">
-              <span className="text-sm font-black font-mono tracking-wider text-zinc-950 dark:text-zinc-100">
-                TONESMITH
-              </span>
-              <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-amber-500/15 text-amber-700 dark:text-amber-400 font-black border border-amber-500/30">
-                GUITAR LAB
-              </span>
-            </div>
-            <span className="text-[10px] font-mono text-zinc-600 dark:text-zinc-400 font-medium hidden xl:inline">
-              Wiring Simulator & Physical Schematic Builder
+          <div className="flex items-baseline gap-2">
+            <span className="text-sm font-black font-mono tracking-wider text-stone-900 dark:text-stone-100">
+              TONESMITH
+            </span>
+            <span className="text-[10px] font-mono tracking-widest uppercase text-amber-700 dark:text-amber-400 font-semibold hidden sm:inline">
+              LUTHIER LAB
             </span>
           </div>
         </div>
+
+        {/* ZONE 2: Streamlined Desktop Menu Bar */}
+        <nav
+          ref={menuContainerRef}
+          aria-label="Workbench actions"
+          className="flex items-center gap-0.5 text-xs font-medium text-stone-700 dark:text-stone-300 relative"
+        >
+          {/* FILE MENU */}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => toggleMenu('file')}
+              className={`flex items-center gap-1 px-2.5 py-1.5 rounded-md hover:bg-stone-100 dark:hover:bg-stone-800/80 hover:text-stone-950 dark:hover:text-white transition-colors cursor-pointer ${
+                openMenu === 'file' ? 'bg-stone-100 dark:bg-stone-800 text-stone-950 dark:text-white font-semibold' : ''
+              }`}
+            >
+              <span>File</span>
+              <ChevronDown className="w-3 h-3 opacity-60" />
+            </button>
+
+            {openMenu === 'file' && (
+              <div className="absolute top-full left-0 mt-1.5 w-60 py-1.5 bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 rounded-xl shadow-xl z-50 animate-in fade-in zoom-in-95 duration-100">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOpenMenu(null);
+                    onClearCanvas();
+                  }}
+                  className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-left hover:bg-stone-100 dark:hover:bg-stone-800/80 text-rose-600 dark:text-rose-400 hover:text-rose-700 dark:hover:text-rose-300 transition-colors"
+                >
+                  <span className="flex items-center gap-2">
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>New / Clear Cavity</span>
+                  </span>
+                  <span className="text-[10px] font-mono text-stone-400">Ctrl+Z to undo</span>
+                </button>
+
+                <div className="h-[1px] bg-stone-100 dark:bg-stone-800 my-1" />
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOpenMenu(null);
+                    fileInputRef.current?.click();
+                  }}
+                  className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-left hover:bg-stone-100 dark:hover:bg-stone-800/80 text-stone-700 dark:text-stone-300 hover:text-stone-950 dark:hover:text-white transition-colors"
+                >
+                  <span className="flex items-center gap-2">
+                    <FolderOpen className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
+                    <span>Import JSON Circuit...</span>
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOpenMenu(null);
+                    onOpenExport();
+                  }}
+                  className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-left hover:bg-stone-100 dark:hover:bg-stone-800/80 text-stone-700 dark:text-stone-300 hover:text-stone-950 dark:hover:text-white transition-colors"
+                >
+                  <span className="flex items-center gap-2">
+                    <Download className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
+                    <span>Export Schematic & BOM...</span>
+                  </span>
+                </button>
+
+                <div className="h-[1px] bg-stone-100 dark:bg-stone-800 my-1" />
+
+                <button
+                  type="button"
+                  onClick={handlePrint}
+                  className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-left hover:bg-stone-100 dark:hover:bg-stone-800/80 text-stone-700 dark:text-stone-300 hover:text-stone-950 dark:hover:text-white transition-colors"
+                >
+                  <span className="flex items-center gap-2">
+                    <Printer className="w-3.5 h-3.5 text-stone-500" />
+                    <span>Print Schematic</span>
+                  </span>
+                  <span className="text-[10px] font-mono text-stone-400">Ctrl+P</span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* PRESETS MENU */}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => toggleMenu('presets')}
+              className={`flex items-center gap-1 px-2.5 py-1.5 rounded-md hover:bg-stone-100 dark:hover:bg-stone-800/80 hover:text-stone-950 dark:hover:text-white transition-colors cursor-pointer ${
+                openMenu === 'presets' ? 'bg-stone-100 dark:bg-stone-800 text-stone-950 dark:text-white font-semibold' : ''
+              }`}
+            >
+              <span>Presets</span>
+              <ChevronDown className="w-3 h-3 opacity-60" />
+            </button>
+
+            {openMenu === 'presets' && (
+              <div className="absolute top-full left-0 mt-1.5 w-72 py-1.5 bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 rounded-xl shadow-xl z-50 animate-in fade-in zoom-in-95 duration-100">
+                <div className="px-3.5 py-1 text-[10px] font-mono uppercase tracking-wider text-stone-400 font-bold">
+                  Standard Guitar Wirings
+                </div>
+                {quickPresets.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      if (onSelectPresetDirect) {
+                        onSelectPresetDirect(preset);
+                      } else {
+                        onOpenPresets();
+                      }
+                    }}
+                    className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-left hover:bg-amber-500/10 hover:text-amber-700 dark:hover:text-amber-400 text-stone-800 dark:text-stone-200 transition-colors"
+                  >
+                    <span className="truncate">{preset.name}</span>
+                    <span className="text-[10px] font-mono text-stone-400 shrink-0 ml-2">{preset.category}</span>
+                  </button>
+                ))}
+
+                <div className="h-[1px] bg-stone-100 dark:bg-stone-800 my-1" />
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setOpenMenu(null);
+                    onOpenPresets();
+                  }}
+                  className="w-full flex items-center justify-between px-3.5 py-2 text-xs font-semibold text-amber-600 dark:text-amber-400 hover:bg-stone-100 dark:hover:bg-stone-800/80 text-left transition-colors"
+                >
+                  <span className="flex items-center gap-2">
+                    <BookOpen className="w-3.5 h-3.5" />
+                    <span>Browse All 14 Presets...</span>
+                  </span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* TOOLS MENU */}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => toggleMenu('tools')}
+              className={`flex items-center gap-1 px-2.5 py-1.5 rounded-md hover:bg-stone-100 dark:hover:bg-stone-800/80 hover:text-stone-950 dark:hover:text-white transition-colors cursor-pointer ${
+                openMenu === 'tools' ? 'bg-stone-100 dark:bg-stone-800 text-stone-950 dark:text-white font-semibold' : ''
+              }`}
+            >
+              <span>Tools</span>
+              <ChevronDown className="w-3 h-3 opacity-60" />
+            </button>
+
+            {openMenu === 'tools' && (
+              <div className="absolute top-full left-0 mt-1.5 w-68 py-1.5 bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 rounded-xl shadow-xl z-50 animate-in fade-in zoom-in-95 duration-100">
+                {onOpenAnalysisReport && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      onOpenAnalysisReport();
+                    }}
+                    className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-left hover:bg-stone-100 dark:hover:bg-stone-800/80 text-stone-700 dark:text-stone-300 hover:text-stone-950 dark:hover:text-white transition-colors"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
+                    <span>Switching Combinations Matrix</span>
+                  </button>
+                )}
+
+                {onOpenNotes && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      onOpenNotes();
+                    }}
+                    className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-left hover:bg-stone-100 dark:hover:bg-stone-800/80 text-stone-700 dark:text-stone-300 hover:text-stone-950 dark:hover:text-white transition-colors"
+                  >
+                    <FileEdit className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
+                    <span>Technician Notes & Bench Log</span>
+                  </button>
+                )}
+
+                <div className="h-[1px] bg-stone-100 dark:bg-stone-800 my-1" />
+
+                {onOpenAbout && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOpenMenu(null);
+                      onOpenAbout();
+                    }}
+                    className="w-full flex items-center gap-2.5 px-3.5 py-2 text-xs text-left hover:bg-stone-100 dark:hover:bg-stone-800/80 text-stone-700 dark:text-stone-300 hover:text-stone-950 dark:hover:text-white transition-colors"
+                  >
+                    <HelpCircle className="w-3.5 h-3.5 text-stone-400" />
+                    <span>About ToneSmith Workbench</span>
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* VIEW MENU */}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => toggleMenu('view')}
+              className={`flex items-center gap-1 px-2.5 py-1.5 rounded-md hover:bg-stone-100 dark:hover:bg-stone-800/80 hover:text-stone-950 dark:hover:text-white transition-colors cursor-pointer ${
+                openMenu === 'view' ? 'bg-stone-100 dark:bg-stone-800 text-stone-950 dark:text-white font-semibold' : ''
+              }`}
+            >
+              <span>View</span>
+              <ChevronDown className="w-3 h-3 opacity-60" />
+            </button>
+
+            {openMenu === 'view' && (
+              <div className="absolute top-full left-0 mt-1.5 w-60 py-1.5 bg-white dark:bg-stone-900 border border-stone-200 dark:border-stone-800 rounded-xl shadow-xl z-50 animate-in fade-in zoom-in-95 duration-100">
+                {onToggleSignalPath && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onToggleSignalPath();
+                      setOpenMenu(null);
+                    }}
+                    className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-left hover:bg-stone-100 dark:hover:bg-stone-800/80 text-stone-700 dark:text-stone-300 transition-colors"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Zap className="w-3.5 h-3.5 text-amber-500" />
+                      <span>Signal Path Trace</span>
+                    </span>
+                    {showSignalPath && <Check className="w-3.5 h-3.5 text-emerald-500" />}
+                  </button>
+                )}
+
+                {onToggleInteractiveMode && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onToggleInteractiveMode();
+                      setOpenMenu(null);
+                    }}
+                    className="w-full flex items-center justify-between px-3.5 py-2 text-xs text-left hover:bg-stone-100 dark:hover:bg-stone-800/80 text-stone-700 dark:text-stone-300 transition-colors"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Sliders className="w-3.5 h-3.5 text-blue-500" />
+                      <span>Interactive Play Mode</span>
+                    </span>
+                    {isInteractiveMode && <Check className="w-3.5 h-3.5 text-emerald-500" />}
+                  </button>
+                )}
+
+                <div className="h-[1px] bg-stone-100 dark:bg-stone-800 my-1" />
+
+                {onResetView && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onResetView();
+                      setOpenMenu(null);
+                    }}
+                    className="w-full flex items-center gap-2 px-3.5 py-2 text-xs text-left hover:bg-stone-100 dark:hover:bg-stone-800/80 text-stone-700 dark:text-stone-300 transition-colors"
+                  >
+                    <Compass className="w-3.5 h-3.5 text-stone-400" />
+                    <span>Reset Cavity View (100%)</span>
+                  </button>
+                )}
+
+                {onOpenHelp && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onOpenHelp();
+                      setOpenMenu(null);
+                    }}
+                    className="w-full flex items-center gap-2 px-3.5 py-2 text-xs text-left hover:bg-stone-100 dark:hover:bg-stone-800/80 text-stone-700 dark:text-stone-300 transition-colors"
+                  >
+                    <HelpCircle className="w-3.5 h-3.5 text-stone-400" />
+                    <span>Wiring Guide & Shortcuts</span>
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        </nav>
       </div>
 
-      {/* Center Tools: Stop Audio, Undo, Redo, Wire Color Selector */}
-      <div className="flex items-center gap-3">
-        {/* Quick Stop Audio Button when audio playback is active */}
-        {isAudioPlaying && (
-          <button
-            type="button"
-            onClick={() => guitarAudio.stopRiff()}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-zinc-950 text-xs font-mono font-black animate-pulse shadow-md shadow-amber-500/30 transition-all border border-amber-400 cursor-pointer"
-            title="Stop guitar audio playback immediately"
-          >
-            <Square className="w-3.5 h-3.5 fill-current" />
-            <span>STOP AUDIO</span>
-          </button>
-        )}
-
+      {/* ZONE 3: Primary Action & Tools */}
+      <div className="flex items-center gap-2 shrink-0">
         {/* Undo / Redo */}
-        <div className="flex items-center gap-1 bg-zinc-100 dark:bg-zinc-950/70 p-1 rounded-lg border border-zinc-300 dark:border-zinc-800">
+        <div className="flex items-center gap-0.5 bg-stone-100 dark:bg-stone-900/90 p-0.5 rounded-lg border border-stone-200 dark:border-stone-800">
           <button
             type="button"
             onClick={onUndo}
@@ -154,11 +456,11 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             title="Undo (Ctrl+Z)"
             className={`p-1.5 rounded transition-all ${
               canUndo
-                ? 'text-zinc-800 dark:text-zinc-200 hover:text-zinc-950 dark:hover:text-white hover:bg-zinc-200 dark:hover:bg-zinc-800'
-                : 'text-zinc-400 dark:text-zinc-600 cursor-not-allowed'
+                ? 'text-stone-800 dark:text-stone-200 hover:text-stone-950 dark:hover:text-white hover:bg-stone-200 dark:hover:bg-stone-800'
+                : 'text-stone-400 dark:text-stone-600 cursor-not-allowed'
             }`}
           >
-            <Undo className="w-4 h-4" />
+            <Undo2 className="w-3.5 h-3.5" />
           </button>
           <button
             type="button"
@@ -167,185 +469,48 @@ export const Toolbar: React.FC<ToolbarProps> = ({
             title="Redo (Ctrl+Y)"
             className={`p-1.5 rounded transition-all ${
               canRedo
-                ? 'text-zinc-800 dark:text-zinc-200 hover:text-zinc-950 dark:hover:text-white hover:bg-zinc-200 dark:hover:bg-zinc-800'
-                : 'text-zinc-400 dark:text-zinc-600 cursor-not-allowed'
+                ? 'text-stone-800 dark:text-stone-200 hover:text-stone-950 dark:hover:text-white hover:bg-stone-200 dark:hover:bg-stone-800'
+                : 'text-stone-400 dark:text-stone-600 cursor-not-allowed'
             }`}
           >
-            <Redo className="w-4 h-4" />
+            <Redo2 className="w-3.5 h-3.5" />
           </button>
         </div>
 
-        {/* Wire Color Controls (Only in Edit Mode) */}
-        {!isInteractiveMode && (
-          <>
-            {selectedWireId ? (
-              /* Selected Wire Active Color Changer */
-              <div className="flex items-center gap-1.5 bg-amber-100/90 dark:bg-amber-950/40 border border-amber-400 dark:border-amber-500/50 p-1 rounded-lg shadow-md animate-in fade-in">
-                <div className="flex items-center gap-1 px-1.5 text-amber-800 dark:text-amber-300">
-                  <Palette className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
-                  <span className="text-[11px] font-mono font-bold whitespace-nowrap">
-                    Wire Color:
-                  </span>
-                </div>
-                <div className="flex items-center gap-1">
-                  {WIRE_COLOR_OPTIONS.map(({ color, label, isDark }) => {
-                    const currentWireColor = selectedWire?.color || activeWireColor;
-                    const isCurrent = currentWireColor.toLowerCase() === color.toLowerCase();
-                    return (
-                      <button
-                        key={color}
-                        type="button"
-                        onClick={() => handleSelectColor(color)}
-                        title={`Change wire to ${label}`}
-                        className={`w-5 h-5 rounded-full border-2 transition-all flex items-center justify-center relative ${
-                          isCurrent
-                            ? 'border-zinc-950 dark:border-white scale-125 shadow-md shadow-amber-400/40 ring-2 ring-amber-400/60 z-10'
-                            : 'border-zinc-400 dark:border-zinc-700 hover:scale-110 hover:border-zinc-800 dark:hover:border-zinc-300'
-                        }`}
-                        style={{ backgroundColor: color }}
-                      >
-                        {isCurrent && (
-                          <Check
-                            className={`w-2.5 h-2.5 stroke-[3] ${
-                              isDark || color === '#18181b' ? 'text-white' : 'text-zinc-950'
-                            }`}
-                          />
-                        )}
-                      </button>
-                    );
-                  })}
-
-                  {/* Custom Hex Color Picker */}
-                  <label
-                    title="Choose custom wire color"
-                    className="w-5 h-5 rounded-full border border-zinc-400 dark:border-zinc-600 hover:border-zinc-950 dark:hover:border-white hover:scale-110 cursor-pointer overflow-hidden relative flex items-center justify-center bg-gradient-to-br from-red-500 via-amber-400 via-emerald-400 to-blue-500 ml-0.5 shadow-sm"
-                  >
-                    <input
-                      type="color"
-                      value={selectedWire?.color || activeWireColor}
-                      onChange={(e) => handleSelectColor(e.target.value)}
-                      className="opacity-0 absolute inset-0 w-full h-full cursor-pointer"
-                    />
-                  </label>
-                </div>
-              </div>
-            ) : (
-              /* Default Wire Color Palette for New Wires */
-              <div className="hidden lg:flex items-center gap-1.5 bg-zinc-100 dark:bg-zinc-950/70 p-1.5 rounded-lg border border-zinc-300 dark:border-zinc-800">
-                <span className="text-[10px] font-mono text-zinc-700 dark:text-zinc-400 font-semibold px-1">Wire:</span>
-                {WIRE_COLOR_OPTIONS.map(({ color, label, isDark }) => {
-                  const isCurrent = activeWireColor.toLowerCase() === color.toLowerCase();
-                  return (
-                    <button
-                      key={color}
-                      type="button"
-                      onClick={() => handleSelectColor(color)}
-                      title={`Default: ${label}`}
-                      className={`w-5 h-5 rounded-full border-2 transition-all flex items-center justify-center ${
-                        isCurrent
-                          ? 'border-zinc-950 dark:border-white scale-125 shadow-md shadow-amber-400/30 ring-2 ring-amber-400/50'
-                          : 'border-zinc-400 dark:border-zinc-700 hover:scale-110 hover:border-zinc-800 dark:hover:border-zinc-300'
-                      }`}
-                      style={{ backgroundColor: color }}
-                    >
-                      {isCurrent && (
-                        <Check
-                          className={`w-2.5 h-2.5 stroke-[3] ${
-                            isDark || color === '#18181b' ? 'text-white' : 'text-zinc-950'
-                          }`}
-                        />
-                      )}
-                    </button>
-                  );
-                })}
-
-                {/* Custom Color Picker for New Wires */}
-                <label
-                  title="Choose custom wire color"
-                  className="w-5 h-5 rounded-full border border-zinc-400 dark:border-zinc-600 hover:border-zinc-950 dark:hover:border-white hover:scale-110 cursor-pointer overflow-hidden relative flex items-center justify-center bg-gradient-to-br from-red-500 via-amber-400 via-emerald-400 to-blue-500 ml-0.5 shadow-sm"
-                >
-                  <input
-                    type="color"
-                    value={activeWireColor}
-                    onChange={(e) => handleSelectColor(e.target.value)}
-                    className="opacity-0 absolute inset-0 w-full h-full cursor-pointer"
-                  />
-                </label>
-              </div>
-            )}
-          </>
+        {/* Stop Audio Indicator Button (Only active when audio is playing) */}
+        {isAudioPlaying && (
+          <button
+            type="button"
+            onClick={() => guitarAudio.stopRiff()}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-amber-500 hover:bg-amber-400 text-stone-950 text-xs font-mono font-bold animate-pulse shadow-sm shadow-amber-500/30 transition-all border border-amber-400 cursor-pointer"
+            title="Stop guitar audio loop"
+          >
+            <Square className="w-3 h-3 fill-current" />
+            <span>STOP</span>
+          </button>
         )}
 
-        {/* Delete Selected Wire Button (Only in Edit Mode when a wire is selected) */}
-        {!isInteractiveMode && selectedWireId && (
+        {/* Delete Selected Item Button (when an element is selected) */}
+        {(selectedWireId || selectedComponentId) && (
           <button
             type="button"
             onClick={onDeleteSelected}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-rose-500/15 dark:bg-rose-500/20 text-rose-700 dark:text-rose-300 border border-rose-500/40 text-xs font-mono font-bold hover:bg-rose-500/25 transition-all cursor-pointer"
-            title="Delete Selected Wire"
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-rose-500/15 text-rose-700 dark:text-rose-300 border border-rose-500/30 text-xs font-mono font-bold hover:bg-rose-500/25 transition-all cursor-pointer"
+            title="Delete selected wire or component (Delete key)"
           >
-            <Trash2 className="w-3.5 h-3.5" />
-            <span>Delete Wire</span>
-          </button>
-        )}
-      </div>
-
-      {/* Right Action Buttons */}
-      <div className="flex items-center gap-2">
-        {/* Analysis Report Button */}
-        {onOpenAnalysisReport && (
-          <button
-            type="button"
-            onClick={onOpenAnalysisReport}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-900 dark:text-zinc-200 border border-zinc-300 dark:border-zinc-700 text-xs font-mono font-bold transition-all cursor-pointer"
-            title="View comprehensive report of all switch & push/pull combinations"
-          >
-            <FileSpreadsheet className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
-            <span className="hidden md:inline">Analysis Report</span>
+            <Trash2 className="w-3 h-3" />
+            <span className="hidden sm:inline">Delete</span>
           </button>
         )}
 
-        {/* Preset Diagrams Button */}
-        <button
-          type="button"
-          onClick={onOpenPresets}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-900 dark:text-zinc-200 border border-zinc-300 dark:border-zinc-700 text-xs font-mono font-bold transition-all cursor-pointer"
-        >
-          <BookOpen className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
-          <span className="hidden sm:inline">Wiring Diagrams</span>
-        </button>
-
-        {/* Technician Notes Button */}
-        {onOpenNotes && (
-          <button
-            type="button"
-            onClick={onOpenNotes}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-100 hover:bg-zinc-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-zinc-900 dark:text-zinc-200 border border-zinc-300 dark:border-zinc-700 text-xs font-mono font-bold transition-all cursor-pointer"
-            title="Open Technician Notes (saved in circuit JSON)"
-          >
-            <FileEdit className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
-            <span className="hidden sm:inline">Tech Notes</span>
-          </button>
-        )}
-
-        {/* Export Schematic & BOM */}
+        {/* Primary Action Button: Export Schematic */}
         <button
           type="button"
           onClick={onOpenExport}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-zinc-950 text-xs font-mono font-bold transition-all shadow-md shadow-amber-500/20"
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-stone-950 font-bold text-xs font-mono transition-all shadow-sm shadow-amber-600/20 cursor-pointer whitespace-nowrap"
         >
           <Download className="w-3.5 h-3.5" />
-          <span>Export Schematic</span>
-        </button>
-
-        {/* Clear Canvas */}
-        <button
-          type="button"
-          onClick={onClearCanvas}
-          title="Clear Canvas (remove all components & wires)"
-          className="p-2 rounded-lg text-zinc-700 dark:text-zinc-400 hover:text-rose-600 dark:hover:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/30 transition-colors"
-        >
-          <RotateCcw className="w-4 h-4" />
+          <span>Export</span>
         </button>
 
         {/* Hidden Import file input */}
@@ -356,39 +521,30 @@ export const Toolbar: React.FC<ToolbarProps> = ({
           onChange={handleFileChange}
           className="hidden"
         />
-        <button
-          type="button"
-          onClick={() => fileInputRef.current?.click()}
-          title="Import JSON schematic"
-          className="p-2 rounded-lg text-zinc-700 dark:text-zinc-400 hover:text-zinc-950 dark:hover:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors hidden md:block"
-        >
-          <FolderOpen className="w-4 h-4" />
-        </button>
 
-        {/* Light / Dark Mode Toggle Button */}
+        {/* Theme Toggle */}
         {onToggleTheme && (
           <button
             type="button"
             onClick={onToggleTheme}
             title={theme === 'dark' ? 'Switch to Light Theme' : 'Switch to Dark Theme'}
-            className="p-2 rounded-lg text-zinc-800 dark:text-zinc-400 hover:text-amber-600 dark:hover:text-amber-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-all border border-zinc-300 dark:border-zinc-700 shadow-xs"
+            className="p-1.5 rounded-lg text-stone-700 dark:text-stone-300 hover:text-amber-600 dark:hover:text-amber-400 hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors border border-stone-200 dark:border-stone-800 cursor-pointer"
           >
             {theme === 'dark' ? (
-              <Sun className="w-4 h-4 text-amber-400 transition-transform hover:rotate-45" />
+              <Sun className="w-3.5 h-3.5 text-amber-400" />
             ) : (
-              <Moon className="w-4 h-4 text-zinc-800 transition-transform hover:-rotate-12" />
+              <Moon className="w-3.5 h-3.5 text-stone-700" />
             )}
           </button>
         )}
 
-        {/* About ("?" Question Mark Icon) Button */}
-        {onOpenAbout && (
+        {/* Guide / About modal trigger */}
+        {onOpenHelp && (
           <button
             type="button"
-            onClick={onOpenAbout}
-            title="About ToneSmith & Creator (Gek Siong)"
-            aria-label="About ToneSmith"
-            className="p-2 rounded-lg text-zinc-800 dark:text-zinc-400 hover:text-amber-600 dark:hover:text-amber-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-all border border-zinc-300 dark:border-zinc-700 shadow-xs cursor-pointer"
+            onClick={onOpenHelp}
+            title="Wiring Guide & Quick Tips"
+            className="p-1.5 rounded-lg text-stone-700 dark:text-stone-400 hover:text-stone-950 dark:hover:text-stone-200 hover:bg-stone-100 dark:hover:bg-stone-800 transition-colors cursor-pointer"
           >
             <HelpCircle className="w-4 h-4" />
           </button>

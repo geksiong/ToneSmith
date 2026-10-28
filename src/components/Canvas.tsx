@@ -867,114 +867,93 @@ export const Canvas: React.FC<CanvasProps> = ({
         })()}
       </div>
 
-      {/* Floating Canvas Zoom, View, Signal Path & Interactive Controls */}
+      {/* Sleek Centered Canvas Dock (Zoom, Reset, Signal Path & Interactive Controls) */}
       <div
-        className="absolute bottom-4 left-4 z-30 flex flex-col bg-white/95 dark:bg-zinc-900/95 backdrop-blur border border-zinc-300 dark:border-zinc-700/80 rounded-xl shadow-xl text-zinc-800 dark:text-zinc-200 select-none overflow-hidden max-w-xl"
+        className="absolute bottom-5 left-1/2 -translate-x-1/2 z-30 flex items-center gap-1 p-1 bg-white/95 dark:bg-[#181513]/95 backdrop-blur-md border border-stone-200 dark:border-stone-800/90 rounded-full shadow-xl text-stone-800 dark:text-stone-200 select-none px-2 transition-all"
         onMouseDown={(e) => e.stopPropagation()}
       >
-        {/* Controls Row */}
-        <div className="flex items-center gap-1.5 p-1">
-          <button
-            type="button"
-            onClick={() => setZoom((z) => Math.min(2.0, z + 0.15))}
-            title="Zoom In"
-            className="w-7 h-7 flex items-center justify-center font-bold hover:text-zinc-950 dark:hover:text-white hover:bg-zinc-200 dark:hover:bg-zinc-800 rounded font-mono text-sm cursor-pointer"
-          >
-            +
-          </button>
-          <span className="text-[11px] font-mono text-zinc-700 dark:text-zinc-300 font-bold px-1 w-12 text-center">
-            {Math.round(zoom * 100)}%
-          </span>
-          <button
-            type="button"
-            onClick={() => setZoom((z) => Math.max(0.4, z - 0.15))}
-            title="Zoom Out"
-            className="w-7 h-7 flex items-center justify-center font-bold hover:text-zinc-950 dark:hover:text-white hover:bg-zinc-200 dark:hover:bg-zinc-800 rounded font-mono text-sm cursor-pointer"
-          >
-            -
-          </button>
-          <div className="w-[1px] h-4 bg-zinc-300 dark:bg-zinc-700 mx-0.5" />
-          <button
-            type="button"
-            onClick={() => {
-              setZoom(1.0);
-              setPan({ x: 40, y: 30 });
-            }}
-            title="Reset View"
-            className="px-2 h-7 flex items-center text-[10px] font-mono font-bold hover:text-zinc-950 dark:hover:text-white hover:bg-zinc-200 dark:hover:bg-zinc-800 rounded cursor-pointer"
-          >
-            Reset View
-          </button>
+        <button
+          type="button"
+          onClick={() => setZoom((z) => Math.max(0.4, z - 0.15))}
+          title="Zoom Out"
+          className="w-6 h-6 flex items-center justify-center font-bold text-stone-600 dark:text-stone-400 hover:text-stone-950 dark:hover:text-white hover:bg-stone-100 dark:hover:bg-stone-800 rounded-full font-mono text-sm cursor-pointer transition-colors"
+        >
+          -
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setZoom(1.0);
+            setPan({ x: 40, y: 30 });
+          }}
+          title="Reset to 100%"
+          className="text-[11px] font-mono text-stone-700 dark:text-stone-300 font-bold px-1 min-w-10 text-center hover:text-amber-600 dark:hover:text-amber-400 cursor-pointer"
+        >
+          {Math.round(zoom * 100)}%
+        </button>
+        <button
+          type="button"
+          onClick={() => setZoom((z) => Math.min(2.0, z + 0.15))}
+          title="Zoom In"
+          className="w-6 h-6 flex items-center justify-center font-bold text-stone-600 dark:text-stone-400 hover:text-stone-950 dark:hover:text-white hover:bg-stone-100 dark:hover:bg-stone-800 rounded-full font-mono text-sm cursor-pointer transition-colors"
+        >
+          +
+        </button>
 
-          {onToggleSignalPath && (
-            <>
-              <div className="w-[1px] h-4 bg-zinc-300 dark:bg-zinc-700 mx-0.5" />
-              <button
-                type="button"
-                onClick={onToggleSignalPath}
-                title={showSignalPath ? 'Hide Signal Path trace' : 'Show Signal Path trace'}
-                className={`px-2 h-7 flex items-center gap-1.5 text-[10px] font-mono font-bold rounded transition-all cursor-pointer ${
-                  showSignalPath
-                    ? 'bg-emerald-500 text-zinc-950 shadow-md shadow-emerald-500/20'
-                    : 'text-zinc-700 dark:text-zinc-300 hover:text-zinc-950 dark:hover:text-white hover:bg-zinc-200 dark:hover:bg-zinc-800'
-                }`}
-              >
-                <Zap className={`w-3 h-3 ${showSignalPath ? 'fill-current' : ''}`} />
-                <span>Signal Path {showSignalPath ? 'ON' : 'OFF'}</span>
-              </button>
-            </>
-          )}
+        <div className="w-[1px] h-3.5 bg-stone-200 dark:bg-stone-800 mx-1" />
 
-          {onToggleInteractiveMode && (
-            <>
-              <div className="w-[1px] h-4 bg-zinc-300 dark:bg-zinc-700 mx-0.5" />
-              <button
-                type="button"
-                onClick={onToggleInteractiveMode}
-                title={
-                  isInteractiveMode
-                    ? 'Interactive Mode: Controls live, canvas locked. Click to switch to Edit mode.'
-                    : 'Edit Mode: Drag parts and wire lugs. Click to switch to Interactive mode.'
-                }
-                className={`px-2.5 h-7 flex items-center gap-1.5 text-[10px] font-mono font-bold rounded transition-all cursor-pointer ${
-                  isInteractiveMode
-                    ? 'bg-emerald-500 text-zinc-950 shadow-md shadow-emerald-500/20 ring-1 ring-emerald-400/40'
-                    : 'text-zinc-700 dark:text-zinc-300 hover:text-zinc-950 dark:hover:text-white hover:bg-zinc-200 dark:hover:bg-zinc-800'
-                }`}
-              >
-                <Gamepad2 className={`w-3 h-3 ${isInteractiveMode ? 'fill-current' : ''}`} />
-                <span>Interactive {isInteractiveMode ? 'ON' : 'OFF'}</span>
-              </button>
-            </>
-          )}
-        </div>
+        <button
+          type="button"
+          onClick={() => {
+            setZoom(1.0);
+            setPan({ x: 40, y: 30 });
+          }}
+          title="Reset Cavity Center"
+          className="px-2 h-6 flex items-center text-[10px] font-mono font-medium text-stone-600 dark:text-stone-400 hover:text-stone-950 dark:hover:text-white hover:bg-stone-100 dark:hover:bg-stone-800 rounded-full cursor-pointer transition-colors"
+        >
+          Reset
+        </button>
 
-        {/* Info messages displayed below the floating panel at the bottom */}
-        {(isInteractiveMode || showSignalPath) && (
-          <div className="border-t border-zinc-200 dark:border-zinc-800/80 px-2.5 py-1.5 text-[10px] font-mono flex flex-col gap-1 bg-zinc-50/80 dark:bg-zinc-950/50">
-            {isInteractiveMode && (
-              <div className="flex items-center gap-1.5 text-emerald-700 dark:text-emerald-400 font-medium">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
-                <span className="font-bold">Interactive Mode:</span>
-                <span className="text-zinc-600 dark:text-zinc-300">Controls live • Canvas locked</span>
-              </div>
-            )}
-            {showSignalPath && (
-              <div className="flex items-center gap-1.5 text-zinc-700 dark:text-zinc-300">
-                <span
-                  className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                    signalPathInfo?.hasSignalPath ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
-                  }`}
-                />
-                <span className="font-bold text-emerald-700 dark:text-emerald-400">Signal Path:</span>
-                <span>
-                  {signalPathInfo?.hasSignalPath
-                    ? `${signalPathInfo.activeComponentIds.size} components • ${signalPathInfo.activeWireIds.size} wires active to Jack`
-                    : 'No closed circuit from pickups to Jack'}
-                </span>
-              </div>
-            )}
-          </div>
+        {onToggleSignalPath && (
+          <>
+            <div className="w-[1px] h-3.5 bg-stone-200 dark:bg-stone-800 mx-1" />
+            <button
+              type="button"
+              onClick={onToggleSignalPath}
+              title={showSignalPath ? 'Signal Path active: highlighting signal route to jack' : 'Click to trace signal path to output jack'}
+              className={`px-2.5 h-6 flex items-center gap-1.5 text-[10px] font-mono font-medium rounded-full transition-colors cursor-pointer ${
+                showSignalPath
+                  ? 'bg-emerald-600/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30 font-semibold'
+                  : 'text-stone-600 dark:text-stone-400 hover:text-stone-950 dark:hover:text-white hover:bg-stone-100 dark:hover:bg-stone-800'
+              }`}
+            >
+              <Zap className={`w-3 h-3 ${showSignalPath ? 'fill-current text-emerald-500' : ''}`} />
+              <span>Signal Path</span>
+            </button>
+          </>
+        )}
+
+        {onToggleInteractiveMode && (
+          <>
+            <div className="w-[1px] h-3.5 bg-stone-200 dark:bg-stone-800 mx-1" />
+            <button
+              type="button"
+              onClick={onToggleInteractiveMode}
+              title={
+                isInteractiveMode
+                  ? 'Interactive Mode: Knobs & switches live, canvas locked. Click to switch to Edit mode.'
+                  : 'Edit Mode: Drag parts and wire lugs. Click to switch to Interactive mode.'
+              }
+              className={`px-2.5 h-6 flex items-center gap-1.5 text-[10px] font-mono font-medium rounded-full transition-colors cursor-pointer ${
+                isInteractiveMode
+                  ? 'bg-amber-500 text-stone-950 font-bold shadow-xs'
+                  : 'text-stone-600 dark:text-stone-400 hover:text-stone-950 dark:hover:text-white hover:bg-stone-100 dark:hover:bg-stone-800'
+              }`}
+            >
+              <Gamepad2 className={`w-3 h-3 ${isInteractiveMode ? 'fill-current' : ''}`} />
+              <span>{isInteractiveMode ? 'Live Play' : 'Edit Mode'}</span>
+            </button>
+          </>
         )}
       </div>
 

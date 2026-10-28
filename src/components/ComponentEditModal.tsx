@@ -4,6 +4,7 @@ import {
   PotTaper,
 } from '../types/guitar';
 import { COMPONENT_METADATA } from '../lib/componentDefs';
+import { getResistorBands } from './ComponentVisuals';
 import {
   Sliders,
   X,
@@ -512,6 +513,31 @@ export const ComponentEditModal: React.FC<ComponentEditModalProps> = ({
                 />
                 <span className="text-[10px] text-zinc-400">Ω</span>
               </div>
+
+              {/* EIA Resistance Color Bands Preview */}
+              {(() => {
+                const bands = getResistorBands(properties.resistanceOhms ?? 150000);
+                return (
+                  <div className="mt-2 p-2 rounded-lg bg-stone-100 dark:bg-stone-950/80 border border-stone-200 dark:border-stone-800 flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between text-[10px] font-mono">
+                      <span className="text-stone-500 font-bold uppercase">Color Code</span>
+                      <span className="text-amber-600 dark:text-amber-400 font-bold">{bands.formatted}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-1 p-1 bg-stone-200 dark:bg-stone-800 rounded-md shrink-0">
+                        <span className="w-3.5 h-4 rounded-xs shadow-xs" style={{ backgroundColor: bands.band1.hex }} title={`Band 1: ${bands.band1.name}`} />
+                        <span className="w-3.5 h-4 rounded-xs shadow-xs" style={{ backgroundColor: bands.band2.hex }} title={`Band 2: ${bands.band2.name}`} />
+                        <span className="w-3.5 h-4 rounded-xs shadow-xs" style={{ backgroundColor: bands.multiplier.hex }} title={`Multiplier: ${bands.multiplier.name}`} />
+                        <span className="w-1" />
+                        <span className="w-3.5 h-4 rounded-xs shadow-xs border-y border-amber-300/40" style={{ backgroundColor: bands.tolerance.hex }} title={`Tolerance: ${bands.tolerance.name}`} />
+                      </div>
+                      <span className="text-[10px] font-mono text-stone-600 dark:text-stone-300 truncate">
+                        {bands.colorSummary}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           </div>
         )}

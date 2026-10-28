@@ -58,12 +58,12 @@ export const CircuitAnalyzer: React.FC<CircuitAnalyzerProps> = ({ analysis, onOp
               Noise Cancel
             </span>
             {analysis.isHumCancelling ? (
-              <ShieldCheck className="w-3.5 h-3.5 text-emerald-700 dark:text-emerald-400" />
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-700 dark:text-emerald-400 shrink-0" />
             ) : (
-              <ShieldAlert className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
+              <ShieldAlert className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
             )}
           </div>
-          <div className="text-xs font-mono font-black">
+          <div className="text-xs font-mono font-black whitespace-nowrap">
             {analysis.isHumCancelling ? 'HUM-CANCELLING' : '60Hz HUM PRESENT'}
           </div>
         </div>
@@ -80,9 +80,9 @@ export const CircuitAnalyzer: React.FC<CircuitAnalyzerProps> = ({ analysis, onOp
             <span className="text-[9px] font-mono uppercase tracking-wider text-zinc-600 dark:text-zinc-400 font-bold">
               Phase Alignment
             </span>
-            <Zap className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
+            <Zap className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
           </div>
-          <div className="text-xs font-mono font-black uppercase">
+          <div className="text-xs font-mono font-black uppercase whitespace-nowrap">
             {analysis.phaseRelationship === 'out-of-phase'
               ? '⚡ OUT OF PHASE'
               : analysis.phaseRelationship === 'in-phase'
@@ -97,9 +97,9 @@ export const CircuitAnalyzer: React.FC<CircuitAnalyzerProps> = ({ analysis, onOp
             <span className="text-[9px] font-mono uppercase tracking-wider text-zinc-600 dark:text-zinc-400 font-bold">
               Coil Routing
             </span>
-            <Layers className="w-3.5 h-3.5 text-cyan-700 dark:text-cyan-400" />
+            <Layers className="w-3.5 h-3.5 text-cyan-700 dark:text-cyan-400 shrink-0" />
           </div>
-          <div className="text-xs font-mono font-black uppercase text-cyan-800 dark:text-cyan-300">
+          <div className="text-xs font-mono font-black uppercase text-cyan-800 dark:text-cyan-300 whitespace-nowrap">
             {analysis.isCoilSplit
               ? 'COIL SPLIT'
               : analysis.wiringConfiguration === 'series'
@@ -116,49 +116,85 @@ export const CircuitAnalyzer: React.FC<CircuitAnalyzerProps> = ({ analysis, onOp
         {analysis.humCancellingReason}
       </div>
 
-      {/* Selected Pickups & Coils Breakdown */}
+      {/* Selected Pickups & Coils Breakdown with Standardized Column Widths */}
       <div className="flex flex-col gap-1.5">
         <div className="flex items-center justify-between text-[10px] font-mono text-zinc-700 dark:text-zinc-400 font-bold uppercase">
-          <span>Active Coils & Magnetic Polarities ({analysis.activeCoils.length})</span>
+          <span>Active Coils & Polarities ({analysis.activeCoils.length})</span>
           <span>{analysis.activePickups.length} Pickups Selected</span>
         </div>
+
+        {/* Standardized Column Headers */}
+        {analysis.activeCoils.length > 0 && (
+          <div className="flex items-center justify-between text-[9px] font-mono text-zinc-500 dark:text-zinc-400 font-bold uppercase px-2.5 pt-0.5 gap-2">
+            <span className="flex-1 min-w-0">Pickup & Coil</span>
+            <span className="w-[84px] shrink-0 text-right">R & L</span>
+            <span className="w-[74px] shrink-0 text-center">Magnet</span>
+            <span className="w-[94px] shrink-0 text-center">Phase</span>
+          </div>
+        )}
 
         {analysis.activeCoils.length === 0 ? (
           <div className="text-center py-3 text-zinc-600 dark:text-zinc-400 text-[11px] font-mono bg-zinc-100 dark:bg-zinc-950/40 rounded border border-dashed border-zinc-300 dark:border-zinc-800 font-medium">
             No active coils in output path.
           </div>
         ) : (
-          <div className="flex flex-col gap-1 max-h-[140px] overflow-y-auto pr-1">
+          <div className="flex flex-col gap-1.5">
             {analysis.activeCoils.map((coil, i) => (
               <div
                 key={i}
-                className="flex items-center justify-between px-2.5 py-1.5 rounded bg-white dark:bg-zinc-800/60 border border-zinc-300 dark:border-zinc-700/60 text-[10px] font-mono shadow-xs"
+                className="flex items-center justify-between px-2.5 py-1.5 rounded bg-white dark:bg-zinc-800/60 border border-zinc-300 dark:border-zinc-700/60 text-[10px] font-mono shadow-xs gap-2"
               >
-                <div className="flex items-center gap-2">
-                  <Disc className="w-3 h-3 text-amber-600 dark:text-amber-400" />
-                  <span className="font-bold text-zinc-950 dark:text-zinc-100">{coil.pickupName}</span>
-                  <span className="text-zinc-600 dark:text-zinc-400 text-[9px] font-medium">({coil.coilName})</span>
+                {/* Column 1: Pickup and Coil Identity */}
+                <div className="flex items-center gap-2 min-w-0 flex-1">
+                  <Disc className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
+                  <div className="flex flex-col min-w-0 flex-1 justify-center leading-tight">
+                    <span
+                      className="font-bold text-zinc-950 dark:text-zinc-100 text-[10.5px] truncate"
+                      title={coil.pickupName || 'Pickup'}
+                    >
+                      {coil.pickupName || 'Pickup'}
+                    </span>
+                    {coil.coilName &&
+                      coil.coilName !== coil.pickupName &&
+                      coil.coilName !== 'Single Coil' && (
+                        <span className="text-[8.5px] text-zinc-500 dark:text-zinc-400 font-medium truncate">
+                          {coil.coilName}
+                        </span>
+                      )}
+                  </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <span
-                    className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${
-                      coil.magneticPolarity === 'North'
-                        ? 'bg-blue-100 dark:bg-blue-500/20 text-blue-900 dark:text-blue-300 border border-blue-400 dark:border-blue-500/30'
-                        : 'bg-rose-100 dark:bg-rose-500/20 text-rose-900 dark:text-rose-300 border border-rose-400 dark:border-rose-500/30'
-                    }`}
-                  >
-                    Mag: {coil.magneticPolarity}
-                  </span>
-                  <span
-                    className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${
-                      coil.electricalPhase === 'In-Phase'
-                        ? 'bg-emerald-100 dark:bg-emerald-500/20 text-emerald-900 dark:text-emerald-300 border border-emerald-400 dark:border-transparent'
-                        : 'bg-amber-100 dark:bg-amber-500/20 text-amber-900 dark:text-amber-300 border border-amber-400 dark:border-transparent'
-                    }`}
-                  >
-                    {coil.electricalPhase}
-                  </span>
+
+                {/* Column 2: Standardized Resistance and Inductance Readout */}
+                <div
+                  className="w-[84px] shrink-0 text-right font-mono text-[9.5px] font-semibold text-zinc-700 dark:text-zinc-300"
+                  title={`Resistance: ${coil.dcResistanceK} kΩ | Inductance: ${coil.inductanceH} H`}
+                >
+                  <span>{coil.dcResistanceK}kΩ</span>
+                  <span className="text-zinc-400 dark:text-zinc-500 mx-1">·</span>
+                  <span>{coil.inductanceH}H</span>
                 </div>
+
+                {/* Column 3: Standardized Magnetic Polarity Badge */}
+                <span
+                  className={`w-[74px] shrink-0 text-center inline-block px-1 py-0.5 rounded text-[9px] font-bold ${
+                    coil.magneticPolarity === 'North'
+                      ? 'bg-blue-100 dark:bg-blue-500/20 text-blue-900 dark:text-blue-300 border border-blue-400 dark:border-blue-500/30'
+                      : 'bg-rose-100 dark:bg-rose-500/20 text-rose-900 dark:text-rose-300 border border-rose-400 dark:border-rose-500/30'
+                  }`}
+                >
+                  Mag: {coil.magneticPolarity}
+                </span>
+
+                {/* Column 4: Standardized Electrical Phase Badge */}
+                <span
+                  className={`w-[94px] shrink-0 text-center inline-block px-1 py-0.5 rounded text-[9px] font-bold ${
+                    coil.electricalPhase === 'In-Phase'
+                      ? 'bg-emerald-100 dark:bg-emerald-500/20 text-emerald-900 dark:text-emerald-300 border border-emerald-400 dark:border-transparent'
+                      : 'bg-amber-100 dark:bg-amber-500/20 text-amber-900 dark:text-amber-300 border border-amber-400 dark:border-transparent'
+                  }`}
+                >
+                  {coil.electricalPhase}
+                </span>
               </div>
             ))}
           </div>
@@ -167,25 +203,25 @@ export const CircuitAnalyzer: React.FC<CircuitAnalyzerProps> = ({ analysis, onOp
 
       {/* Electrical Specifications Readout */}
       <div className="grid grid-cols-5 gap-1.5 pt-1 border-t border-zinc-200 dark:border-zinc-800/80 text-[10px] font-mono">
-        <div className="p-1.5 bg-zinc-100 dark:bg-zinc-950/50 rounded border border-zinc-300 dark:border-zinc-800">
-          <div className="text-zinc-600 dark:text-zinc-400 text-[9px] font-bold">DC RESISTANCE</div>
-          <div className="text-zinc-950 dark:text-zinc-100 font-black">{analysis.estimatedTotalResistanceK} kΩ</div>
+        <div className="p-1.5 bg-zinc-100 dark:bg-zinc-950/50 rounded border border-zinc-300 dark:border-zinc-800 text-center">
+          <div className="text-zinc-600 dark:text-zinc-400 text-[8.5px] font-bold uppercase truncate">Resistance</div>
+          <div className="text-zinc-950 dark:text-zinc-100 font-black truncate">{analysis.estimatedTotalResistanceK} kΩ</div>
         </div>
-        <div className="p-1.5 bg-zinc-100 dark:bg-zinc-950/50 rounded border border-zinc-300 dark:border-zinc-800">
-          <div className="text-zinc-600 dark:text-zinc-400 text-[9px] font-bold">INDUCTANCE</div>
-          <div className="text-zinc-950 dark:text-zinc-100 font-black">{analysis.estimatedTotalInductanceH} H</div>
+        <div className="p-1.5 bg-zinc-100 dark:bg-zinc-950/50 rounded border border-zinc-300 dark:border-zinc-800 text-center">
+          <div className="text-zinc-600 dark:text-zinc-400 text-[8.5px] font-bold uppercase truncate">Inductance</div>
+          <div className="text-zinc-950 dark:text-zinc-100 font-black truncate">{analysis.estimatedTotalInductanceH} H</div>
         </div>
-        <div className="p-1.5 bg-zinc-100 dark:bg-zinc-950/50 rounded border border-zinc-300 dark:border-zinc-800">
-          <div className="text-zinc-600 dark:text-zinc-400 text-[9px] font-bold">RESONANT f₀</div>
-          <div className="text-amber-800 dark:text-amber-300 font-black">{analysis.resonantFrequencyHz} Hz</div>
+        <div className="p-1.5 bg-zinc-100 dark:bg-zinc-950/50 rounded border border-zinc-300 dark:border-zinc-800 text-center">
+          <div className="text-zinc-600 dark:text-zinc-400 text-[8.5px] font-bold uppercase truncate">Resonant f₀</div>
+          <div className="text-amber-800 dark:text-amber-300 font-black truncate">{analysis.resonantFrequencyHz} Hz</div>
         </div>
-        <div className="p-1.5 bg-zinc-100 dark:bg-zinc-950/50 rounded border border-zinc-300 dark:border-zinc-800">
-          <div className="text-zinc-600 dark:text-zinc-400 text-[9px] font-bold">Q FACTOR</div>
-          <div className="text-purple-800 dark:text-purple-300 font-black">{analysis.qFactor} (+{analysis.peakBoostDb}dB)</div>
+        <div className="p-1.5 bg-zinc-100 dark:bg-zinc-950/50 rounded border border-zinc-300 dark:border-zinc-800 text-center">
+          <div className="text-zinc-600 dark:text-zinc-400 text-[8.5px] font-bold uppercase truncate">Q Factor</div>
+          <div className="text-purple-800 dark:text-purple-300 font-black truncate">{analysis.qFactor} (+{analysis.peakBoostDb}dB)</div>
         </div>
-        <div className="p-1.5 bg-zinc-100 dark:bg-zinc-950/50 rounded border border-zinc-300 dark:border-zinc-800">
-          <div className="text-zinc-600 dark:text-zinc-400 text-[9px] font-bold">TONE CUTOFF</div>
-          <div className="text-cyan-800 dark:text-cyan-300 font-black">
+        <div className="p-1.5 bg-zinc-100 dark:bg-zinc-950/50 rounded border border-zinc-300 dark:border-zinc-800 text-center">
+          <div className="text-zinc-600 dark:text-zinc-400 text-[8.5px] font-bold uppercase truncate">Cutoff</div>
+          <div className="text-cyan-800 dark:text-cyan-300 font-black truncate">
             {analysis.effectiveToneCutoffHz >= 1000
               ? `${(analysis.effectiveToneCutoffHz / 1000).toFixed(1)}k`
               : analysis.effectiveToneCutoffHz} Hz
