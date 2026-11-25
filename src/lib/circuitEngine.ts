@@ -758,7 +758,7 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
       } else {
         humReason = 'Hum-cancelling active! Reverse-wound / opposite electrical polarity cancels 60Hz EMI.';
       }
-    } else if (hasOpposingCancellation && worstDb <= -6) {
+    } else if (hasOpposingCancellation && residualHumDb <= -6) {
       isHumCancelling = false;
       humStatus = 'reduced';
       if (Math.abs(worstDbRounded - residualHumDb) >= 2) {
