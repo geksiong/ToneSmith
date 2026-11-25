@@ -281,8 +281,10 @@ export class GuitarAudioEngine {
     // Hum sound calculation (only audible when audio source is actively playing or monitoring)
     if (this.humGain && this.humEnabled && (this.isRiffPlaying || this.isMicActive)) {
       if (!analysis.isHumCancelling && analysis.activeCoils.length > 0) {
-        // Single coil hum present!
-        const humLevel = 0.035 * vol;
+        // Scale 60Hz hum level by MNA-computed residual hum relative to a single coil
+        const relDb = Math.max(-20, Math.min(6, analysis.residualHumDb ?? 0));
+        const humScale = Math.pow(10, relDb / 20);
+        const humLevel = 0.035 * vol * humScale;
         this.humGain.gain.setTargetAtTime(humLevel, t, rampTime);
       } else {
         // Hum cancelled or no pickups

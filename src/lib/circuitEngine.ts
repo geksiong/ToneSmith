@@ -30,6 +30,7 @@ const BODE_FREQS = generateLogFreqGrid(40, 20000, 65);
 const REF_FREQS = [80, 150, 300, 600, 1200, 2500, 5000, 10000];
 const TOPOLOGY_PROBE_FREQS = [150, 1200];
 const POT_PROBE_FREQS = [200, 5000];
+const HUM_PROBE_FREQS = [60, 180];
 
 const COIL_ACTIVE_ABS_MIN = 0.025; // ~ -32 dB RMS across guitar band
 const COIL_ACTIVE_REL_MIN = 0.18;  // 18% of loudest active coil RMS (rejects parasitic 500k pot bleed)
@@ -443,77 +444,38 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
     wiringConfig = 'parallel';
   }
 
-  // 5. Phase and Hum Cancellation Analysis
-  let isHumCancelling = false;
-  let humReason = '';
+  // 5. Phase Relationship Analysis (Acoustic polarity across pickups/coils)
   let phaseRelationship: 'in-phase' | 'out-of-phase' | 'solo' | 'silent' = 'in-phase';
 
   if (activeCoils.length === 1) {
-    isHumCancelling = false;
-    humReason = 'Single coil active — susceptible to 60Hz ambient electromagnetic interference.';
     phaseRelationship = 'solo';
   } else if (activeCoils.length === 2) {
     const c1 = activeCoils[0];
     const c2 = activeCoils[1];
-
-    const oppositeWinding = c1.electricalPhase !== c2.electricalPhase;
-    if (oppositeWinding) {
-      isHumCancelling = true;
-      humReason = 'Hum-cancelling active! Reverse-wound / opposite electrical polarity cancels 60Hz EMI.';
-    } else {
-      isHumCancelling = false;
-      humReason = 'Both coils have matching electrical polarity — 60Hz hum is additive (not cancelled).';
-    }
 
     const sign1 =
       (c1.magneticPolarity === 'North' ? 1 : -1) * (c1.electricalPhase === 'In-Phase' ? 1 : -1);
     const sign2 =
       (c2.magneticPolarity === 'North' ? 1 : -1) * (c2.electricalPhase === 'In-Phase' ? 1 : -1);
 
-    if (sign1 * sign2 > 0) {
-      phaseRelationship = 'in-phase';
-    } else {
-      phaseRelationship = 'out-of-phase';
-      humReason += ' ⚡ Notice: Pickups are OUT OF PHASE (Peter Green hollow nasal acoustic cancellation).';
-    }
-  } else {
-    const northCount = activeCoils.filter((c) => c.magneticPolarity === 'North').length;
-    const southCount = activeCoils.filter((c) => c.magneticPolarity === 'South').length;
-    const inPhaseCount = activeCoils.filter((c) => c.electricalPhase === 'In-Phase').length;
-    const revPhaseCount = activeCoils.filter((c) => c.electricalPhase === 'Reverse-Phase').length;
-
-    if (Math.abs(inPhaseCount - revPhaseCount) < activeCoils.length) {
-      isHumCancelling = true;
-      humReason = `Balanced multiple coil configuration reduces ambient hum (${northCount}N / ${southCount}S).`;
-    } else {
-      isHumCancelling = false;
-      humReason = 'Unbalanced coils — residual 60Hz hum present.';
-    }
-
-    if (activePickupIdsOrdered.length === 2) {
-      const getPuSign = (puId: string) => {
-        const coils = activeCoils.filter((c) => c.pickupId === puId);
-        let total = 0;
-        for (const c of coils) {
-          const mag = c.magneticPolarity === 'North' ? 1 : -1;
-          const elec = c.electricalPhase === 'In-Phase' ? 1 : -1;
-          total += mag * elec;
-        }
-        return total >= 0 ? 1 : -1;
-      };
-
-      const sign1 = getPuSign(activePickupIdsOrdered[0]);
-      const sign2 = getPuSign(activePickupIdsOrdered[1]);
-
-      if (sign1 * sign2 < 0) {
-        phaseRelationship = 'out-of-phase';
-        humReason += ' ⚡ Notice: Pickups are OUT OF PHASE (Peter Green hollow nasal acoustic cancellation).';
-      } else {
-        phaseRelationship = 'in-phase';
+    phaseRelationship = sign1 * sign2 > 0 ? 'in-phase' : 'out-of-phase';
+  } else if (activePickupIdsOrdered.length === 2) {
+    const getPuSign = (puId: string) => {
+      const coils = activeCoils.filter((c) => c.pickupId === puId);
+      let total = 0;
+      for (const c of coils) {
+        const mag = c.magneticPolarity === 'North' ? 1 : -1;
+        const elec = c.electricalPhase === 'In-Phase' ? 1 : -1;
+        total += mag * elec;
       }
-    } else {
-      phaseRelationship = 'in-phase';
-    }
+      return total >= 0 ? 1 : -1;
+    };
+
+    const sign1 = getPuSign(activePickupIdsOrdered[0]);
+    const sign2 = getPuSign(activePickupIdsOrdered[1]);
+    phaseRelationship = sign1 * sign2 < 0 ? 'out-of-phase' : 'in-phase';
+  } else {
+    phaseRelationship = 'in-phase';
   }
 
   // 6. Equivalent pickup RLC (DC resistance & inductance)
@@ -730,6 +692,89 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
 
   const hasOutputSignal = !isMutedByPot && effectiveVolumeLevel > 0.01;
 
+  // 9b. Exact AC MNA Hum-Cancellation Analysis (60 Hz fundamental + 180 Hz 3rd harmonic)
+  // Ambient mains EMI depends strictly on each coil's winding sense & electrical lead orientation
+  // (independent of permanent magnet polarity) and sums through the full passive impedance network.
+  const humSweep = solveCircuitMNA(state, HUM_PROBE_FREQS, topoOptions);
+  let isHumCancelling = false;
+  let humStatus: 'cancelling' | 'reduced' | 'present' | 'none' = 'present';
+  let residualHumDb = 0;
+  let humReason = '';
+
+  if (humSweep && activeCoilIndices.length > 0) {
+    let activeESum = 0;
+    for (const ci of activeCoilIndices) {
+      activeESum += Math.sqrt(Math.max(0.1, humSweep.coils[ci].inductanceH));
+    }
+    const avgActiveE = activeESum / activeCoilIndices.length;
+    const volScale = isMutedByPot ? 1.0 : Math.max(0.01, effectiveVolumeLevel);
+    const singleCoilRef = Math.max(1e-6, avgActiveE * volScale);
+
+    const evalHumAtBin = (fi: number) => {
+      let sumRe = 0;
+      let sumIm = 0;
+      let incoherentSum = 0;
+      for (let ci = 0; ci < humSweep.coils.length; ci++) {
+        const c = humSweep.coils[ci];
+        const w = c.normalElectricalPhase === 'In-Phase' ? 1 : -1;
+        const e = Math.sqrt(Math.max(0.1, c.inductanceH));
+        const h = humSweep.transfers[ci][fi];
+        sumRe += w * e * h.re;
+        sumIm += w * e * h.im;
+        incoherentSum += e * Math.hypot(h.re, h.im);
+      }
+      const coherentMag = Math.hypot(sumRe, sumIm);
+      const cancelFactor = incoherentSum > 1e-9 ? coherentMag / incoherentSum : 1.0;
+      const ratio = coherentMag / singleCoilRef;
+      return { ratio, cancelFactor };
+    };
+
+    const h60 = evalHumAtBin(0);
+    const h180 = evalHumAtBin(1);
+
+    // Weighted mains hum spectrum (75% power at 60 Hz fundamental, 25% at 180 Hz 3rd harmonic)
+    const combinedRatio = Math.sqrt(0.75 * h60.ratio * h60.ratio + 0.25 * h180.ratio * h180.ratio);
+    const minCancelFactor = Math.min(h60.cancelFactor, h180.cancelFactor);
+
+    // Require genuine opposing-coil cancellation (not merely a single coil behind a high-pass filter)
+    const hasOpposingCancellation = minCancelFactor < 0.85;
+    const rawHumDb = 20 * Math.log10(Math.max(1e-6, combinedRatio));
+    residualHumDb = Math.max(-120, Math.round(rawHumDb * 10) / 10);
+
+    const inPhaseCount = activeCoils.filter((c) => c.electricalPhase === 'In-Phase').length;
+    const revPhaseCount = activeCoils.filter((c) => c.electricalPhase === 'Reverse-Phase').length;
+
+    if (hasOpposingCancellation && residualHumDb <= -20) {
+      isHumCancelling = true;
+      humStatus = 'cancelling';
+      if (residualHumDb > -45) {
+        humReason = `Hum-cancelling active! Opposing coil windings cancel 60Hz EMI (residual hum: ${residualHumDb} dB).`;
+      } else {
+        humReason = 'Hum-cancelling active! Reverse-wound / opposite electrical polarity cancels 60Hz EMI.';
+      }
+    } else if (hasOpposingCancellation && residualHumDb <= -6) {
+      isHumCancelling = false;
+      humStatus = 'reduced';
+      humReason = `Partial hum reduction (${residualHumDb} dB vs. single coil) — opposing windings reduce 60Hz EMI, but residual hum remains.`;
+    } else {
+      isHumCancelling = false;
+      humStatus = 'present';
+      if (activeCoils.length === 1) {
+        humReason = 'Single coil active — susceptible to 60Hz ambient electromagnetic interference.';
+      } else if (inPhaseCount === 0 || revPhaseCount === 0) {
+        humReason = 'Active coils share matching electrical polarity — 60Hz hum is additive (not cancelled).';
+      } else if (activeCoils.length >= 3) {
+        humReason = `Unbalanced multi-coil combination (${inPhaseCount} In-Phase / ${revPhaseCount} Reverse-Phase, ${residualHumDb} dB vs. single coil) — residual 60Hz hum present.`;
+      } else {
+        humReason = `Unbalanced coil impedance (${residualHumDb} dB vs. single coil) — 60Hz hum is not cancelled.`;
+      }
+    }
+
+    if (phaseRelationship === 'out-of-phase') {
+      humReason += ' ⚡ Notice: Pickups are OUT OF PHASE (Peter Green hollow nasal acoustic cancellation).';
+    }
+  }
+
   // 10. Extract resonantFrequencyHz, peakBoostDb, qFactor directly from MNA open-tone sweep
   // Prefer the primary pickup LC resonance in [1100, 14000] Hz (so dual-resonance tuned-split
   // circuits report the true upper single-coil peak rather than the ~600Hz series-cap bump).
@@ -887,6 +932,8 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
     wiringConfiguration: wiringConfig,
     phaseRelationship,
     isHumCancelling,
+    humStatus,
+    residualHumDb,
     humCancellingReason: humReason,
     estimatedTotalResistanceK: Math.round(totalR * 10) / 10,
     estimatedTotalInductanceH: Math.round(totalL * 10) / 10,
@@ -914,6 +961,8 @@ function createSilentResult(issues: string[]): CircuitAnalysisResult {
     wiringConfiguration: 'none',
     phaseRelationship: 'silent',
     isHumCancelling: false,
+    humStatus: 'none',
+    residualHumDb: -120,
     humCancellingReason: 'No signal path completed.',
     estimatedTotalResistanceK: 0,
     estimatedTotalInductanceH: 0,
@@ -1486,7 +1535,7 @@ export function getCircuitResultSignature(result: CircuitAnalysisResult): string
     coilKeys,
     phaseRelationship,
     result.wiringConfiguration,
-    result.isHumCancelling ? 'HC' : 'HUM',
+    result.humStatus || (result.isHumCancelling ? 'cancelling' : 'present'),
     result.isCoilSplit ? 'SPLIT' : 'FULL',
     resK,
     indH,
@@ -1988,8 +2037,9 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
     }
   }
 
-  for (const entry of activeEntries) {
-    const res = entry.items[0].result;
+  const activeGrouped = groupedItems.filter((g) => g.result.hasOutputSignal);
+  for (const g of activeGrouped) {
+    const res = g.result;
     if (res.phaseRelationship === 'out-of-phase') outOfPhaseCount++;
     if (res.wiringConfiguration === 'series') seriesCount++;
     if (res.isCoilSplit) splitCoilCount++;
@@ -2000,7 +2050,7 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
 
   return {
     totalCombinations: items.length,
-    distinctTonesCount: activeEntries.length > 0 ? activeEntries.length : groupedItems.length,
+    distinctTonesCount: activeGrouped.length > 0 ? activeGrouped.length : groupedItems.length,
     switchesCount: switches.length,
     pushPullsCount: pushPulls.length,
     humCancellingCount,

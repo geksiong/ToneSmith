@@ -144,6 +144,8 @@ export interface CircuitAnalysisResult {
   wiringConfiguration: 'solo' | 'parallel' | 'series' | 'complex' | 'none';
   phaseRelationship: 'in-phase' | 'out-of-phase' | 'solo' | 'silent';
   isHumCancelling: boolean;
+  humStatus?: 'cancelling' | 'reduced' | 'present' | 'none';
+  residualHumDb?: number;
   humCancellingReason: string;
   estimatedTotalResistanceK: number;
   estimatedTotalInductanceH: number;

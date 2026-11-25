@@ -50,6 +50,8 @@ export const CircuitAnalyzer: React.FC<CircuitAnalyzerProps> = ({ analysis, onOp
           className={`p-2 rounded-lg border flex flex-col justify-between ${
             analysis.isHumCancelling
               ? 'bg-emerald-100/90 dark:bg-emerald-950/30 border-emerald-400 dark:border-emerald-500/40 text-emerald-950 dark:text-emerald-300'
+              : analysis.humStatus === 'reduced'
+              ? 'bg-amber-100/80 dark:bg-amber-950/30 border-amber-400 dark:border-amber-500/40 text-amber-950 dark:text-amber-300'
               : 'bg-zinc-100 dark:bg-zinc-800/50 border-zinc-300 dark:border-zinc-700/60 text-zinc-800 dark:text-zinc-300'
           }`}
         >
@@ -64,7 +66,11 @@ export const CircuitAnalyzer: React.FC<CircuitAnalyzerProps> = ({ analysis, onOp
             )}
           </div>
           <div className="text-xs font-mono font-black whitespace-nowrap">
-            {analysis.isHumCancelling ? 'HUM-CANCELLING' : '60Hz HUM PRESENT'}
+            {analysis.isHumCancelling
+              ? 'HUM-CANCELLING'
+              : analysis.humStatus === 'reduced'
+              ? 'HUM-REDUCED'
+              : '60Hz HUM PRESENT'}
           </div>
         </div>
 

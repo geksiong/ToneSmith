@@ -208,8 +208,11 @@ export const AnalysisReportModal: React.FC<AnalysisReportModalProps> = ({
         }
 
         const isHum = item.result.isHumCancelling;
+        const isReduced = !isHum && item.result.humStatus === 'reduced';
         const humBadge = isHum
           ? `<span style="color: #059669; font-weight: 700;">✓ Hum-Cancelled</span>`
+          : isReduced
+          ? `<span style="color: #ca8a04; font-weight: 600;">◐ Hum-Reduced</span>`
           : `<span style="color: #b45309;">⚡ 60Hz Hum</span>`;
 
         const phaseBadge =
@@ -532,7 +535,11 @@ export const AnalysisReportModal: React.FC<AnalysisReportModalProps> = ({
     md += `|---| ${controlSeparators}---|---|---|---|---|---|---|\n`;
 
     filteredItems.forEach((item) => {
-      const hum = item.result.isHumCancelling ? 'Hum-Cancelling' : '60Hz Hum';
+      const hum = item.result.isHumCancelling
+        ? 'Hum-Cancelling'
+        : item.result.humStatus === 'reduced'
+        ? 'Hum-Reduced'
+        : '60Hz Hum';
       const phase = item.result.phaseRelationship;
       const wiring = item.result.wiringConfiguration;
       const res = `${item.result.estimatedTotalResistanceK} kΩ`;
@@ -595,7 +602,11 @@ export const AnalysisReportModal: React.FC<AnalysisReportModalProps> = ({
         `"${item.activePickupSummary.replace(/"/g, '""')}"`,
         `"${item.activeCoilsSummary.replace(/"/g, '""')}"`,
         item.result.phaseRelationship,
-        item.result.isHumCancelling ? 'Hum-Cancelling' : 'Single-Coil Hum',
+        item.result.isHumCancelling
+          ? 'Hum-Cancelling'
+          : item.result.humStatus === 'reduced'
+          ? 'Hum-Reduced'
+          : 'Single-Coil Hum',
         item.result.wiringConfiguration,
         item.result.estimatedTotalResistanceK,
         item.result.estimatedTotalInductanceH,
@@ -1138,6 +1149,8 @@ export const AnalysisReportModal: React.FC<AnalysisReportModalProps> = ({
                         <td className="py-2 px-2.5 border-r border-zinc-200 text-[11px]">
                           {item.result.isHumCancelling ? (
                             <span className="text-emerald-700 font-semibold">Hum-Cancelled</span>
+                          ) : item.result.humStatus === 'reduced' ? (
+                            <span className="text-yellow-700 font-semibold">Hum-Reduced</span>
                           ) : (
                             <span className="text-amber-800">60Hz Hum</span>
                           )}
@@ -1346,6 +1359,14 @@ export const AnalysisReportModal: React.FC<AnalysisReportModalProps> = ({
                             <div className="flex items-center gap-1 text-emerald-600 dark:text-emerald-400 font-semibold text-[11px]">
                               <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
                               <span>Hum-Cancelled</span>
+                            </div>
+                          ) : item.result.humStatus === 'reduced' ? (
+                            <div
+                              className="flex items-center gap-1 text-yellow-600 dark:text-yellow-400 font-medium text-[11px]"
+                              title={item.result.humCancellingReason}
+                            >
+                              <Radio className="w-3.5 h-3.5 shrink-0" />
+                              <span>Hum-Reduced</span>
                             </div>
                           ) : (
                             <div className="flex items-center gap-1 text-amber-700 dark:text-amber-400 text-[11px]">
