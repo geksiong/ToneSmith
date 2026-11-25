@@ -4,7 +4,6 @@ import {
   CircuitComponent,
   CircuitState,
   SignalPathInfo,
-  Wire,
   SwitchingCombinationReportItem,
   SwitchingAnalysisReport,
   SwitchingControlDef,
@@ -12,19 +11,181 @@ import {
   GroupedControlValue,
   SwitchingControlOption,
 } from '../types/guitar';
-import { getComponentTerminals } from './componentDefs';
+import {
+  CABLE_CAPACITANCE_PF,
+  STRAY_CAPACITANCE_PF,
+  SHORT_RESISTOR_THRESHOLD_OHMS,
+  CoilModel,
+  ComplexVal,
+  MNASweepResult,
+  addSwitchAndGroundEdges,
+  checkDirectShortCircuit,
+  generateLogFreqGrid,
+  measureEffectiveLoadResistanceK,
+  solveCircuitMNA,
+} from './mnaSolver';
 
-interface GraphNode {
-  componentId: string;
-  terminalId: string;
+// 65 log-spaced frequencies across 40 Hz - 20 kHz for accurate Bode & peak analysis
+const BODE_FREQS = generateLogFreqGrid(40, 20000, 65);
+const REF_FREQS = [80, 150, 300, 600, 1200, 2500, 5000, 10000];
+const TOPOLOGY_PROBE_FREQS = [150, 1200];
+const POT_PROBE_FREQS = [200, 5000];
+
+const COIL_ACTIVE_ABS_MIN = 0.025; // ~ -32 dB RMS across guitar band
+const COIL_ACTIVE_REL_MIN = 0.18;  // 18% of loudest active coil RMS (rejects parasitic 500k pot bleed)
+
+function cMag(v: ComplexVal): number {
+  return Math.hypot(v.re, v.im);
 }
 
-function nodeKey(node: GraphNode): string {
-  return `${node.componentId}:${node.terminalId}`;
+/**
+ * Determines whether a coil is electrically inverted (-1) or non-inverted (+1)
+ * relative to its posTerm -> negTerm orientation by examining passband phase
+ * well below its resonant peak.
+ */
+function determineCoilPolaritySign(
+  transfers: ComplexVal[],
+  freqs: number[]
+): 1 | -1 {
+  let maxMag = 0;
+  let peakIdx = 0;
+  for (let i = 0; i < freqs.length; i++) {
+    if (freqs[i] < 60 || freqs[i] > 14000) continue;
+    const m = cMag(transfers[i]);
+    if (m > maxMag) {
+      maxMag = m;
+      peakIdx = i;
+    }
+  }
+  if (maxMag < 1e-6) return 1;
+
+  const fPeak = freqs[peakIdx];
+  const cutoff = fPeak * 0.55;
+
+  // Below 0.55 * fPeak, passive inductive lag is small (< 45 deg) and series-cap lead
+  // is < 85 deg, so Re(H) > 0 for non-inverted and Re(H) < 0 for inverted.
+  let weightedRe = 0;
+  let weightSum = 0;
+  for (let i = 0; i < freqs.length; i++) {
+    if (freqs[i] > cutoff) break;
+    const m = cMag(transfers[i]);
+    if (m >= 0.2 * maxMag) {
+      weightedRe += transfers[i].re * m;
+      weightSum += m;
+    }
+  }
+
+  if (weightSum > 0) {
+    return weightedRe >= 0 ? 1 : -1;
+  }
+
+  // Fallback for very high-pass circuits whose passband sits right under fPeak
+  let bestIdx = Math.max(0, peakIdx - 1);
+  for (let i = 0; i < peakIdx; i++) {
+    if (cMag(transfers[i]) > cMag(transfers[bestIdx])) {
+      bestIdx = i;
+    }
+  }
+  return transfers[bestIdx].re >= 0 ? 1 : -1;
+}
+
+/**
+ * Computes combined electrical transfer magnitude |H_total(f)| across a frequency sweep.
+ * Coils within each pickup are summed with their true signed EMFs; across distinct pickups,
+ * out-of-phase pickups are aligned constructively for the electrical RLC response so that
+ * acoustic pickup-spacing comb filtering can be applied cleanly on top.
+ */
+function combineElectricalSweep(
+  sweep: MNASweepResult,
+  activeCoilIndices: number[],
+  coilPolaritySigns: Map<number, 1 | -1>,
+  alignOutOfPhasePickups: boolean
+): number[] {
+  const numFreqs = sweep.freqs.length;
+
+  // Group active coil indices by pickupId
+  const pickupGroups = new Map<string, number[]>();
+  for (const ci of activeCoilIndices) {
+    const pid = sweep.coils[ci].pickupId;
+    if (!pickupGroups.has(pid)) pickupGroups.set(pid, []);
+    pickupGroups.get(pid)!.push(ci);
+  }
+
+  // Compute each pickup's acoustic polarity sign (+1 or -1)
+  const pickupSignAlign = new Map<string, 1 | -1>();
+  if (alignOutOfPhasePickups && pickupGroups.size >= 2) {
+    for (const [pid, indices] of pickupGroups) {
+      let netSign = 0;
+      for (const ci of indices) {
+        const c = sweep.coils[ci];
+        const pol = coilPolaritySigns.get(ci) ?? 1;
+        netSign += c.normalStringSign * pol;
+      }
+      pickupSignAlign.set(pid, netSign >= 0 ? 1 : -1);
+    }
+  }
+
+  const mags = new Array<number>(numFreqs);
+  for (let fi = 0; fi < numFreqs; fi++) {
+    let sumRe = 0;
+    let sumIm = 0;
+
+    for (const [pid, indices] of pickupGroups) {
+      let pRe = 0;
+      let pIm = 0;
+      for (const ci of indices) {
+        const c = sweep.coils[ci];
+        const h = sweep.transfers[ci][fi];
+        // Excite coil with its string vibration EMF (baseEmf * normalStringSign)
+        const emf = c.baseEmf * c.normalStringSign;
+        pRe += emf * h.re;
+        pIm += emf * h.im;
+      }
+      const align = pickupSignAlign.get(pid) ?? 1;
+      sumRe += align * pRe;
+      sumIm += align * pIm;
+    }
+
+    mags[fi] = Math.hypot(sumRe, sumIm);
+  }
+
+  return mags;
+}
+
+/**
+ * Computes the RMS audio-band transfer magnitude over the core guitar harmonic range
+ * (80 Hz - 2.5 kHz) for each coil in an MNA sweep.
+ * Using band RMS rather than single-frequency peak prevents disconnected pickups that
+ * weakly bleed treble through a 500k pot track (e.g. Jimmy Page Toggle=Bridge + Series=Up)
+ * from being misclassified as active, while preserving series caps, bass-cut caps,
+ * partial-split resistors, and tuned-split caps.
+ */
+function getCoilAudioBandPeaks(sweep: MNASweepResult): number[] {
+  const scores = new Array<number>(sweep.coils.length).fill(0);
+  for (let ci = 0; ci < sweep.coils.length; ci++) {
+    let sumSq = 0;
+    let count = 0;
+    let peakHigh = 0;
+    for (let fi = 0; fi < sweep.freqs.length; fi++) {
+      const f = sweep.freqs[fi];
+      const m = cMag(sweep.transfers[ci][fi]);
+      if (f >= 75 && f <= 2600) {
+        sumSq += m * m;
+        count++;
+      }
+      if (f >= 800 && f <= 8000 && m > peakHigh) {
+        peakHigh = m;
+      }
+    }
+    const rms = count > 0 ? Math.sqrt(sumSq / count) : 0;
+    // Allow extreme high-pass solo circuits (e.g. tiny 500pF series cap) to still register if mid-band is low
+    scores[ci] = Math.max(rms, peakHigh * 0.25);
+  }
+  return scores;
 }
 
 export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
-  const { components, wires } = state;
+  const { components } = state;
   const compMap = new Map<string, CircuitComponent>();
   for (const c of components) {
     compMap.set(c.id, c);
@@ -38,335 +199,251 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
     return createSilentResult(['No 1/4" Output Jack placed on canvas.']);
   }
 
-  // Build adjacency list for wires and internal switch/pot connections
-  const adj = new Map<string, Set<string>>();
-
-  function addEdge(a: string, b: string) {
-    if (!adj.has(a)) adj.set(a, new Set());
-    if (!adj.has(b)) adj.set(b, new Set());
-    adj.get(a)!.add(b);
-    adj.get(b)!.add(a);
-  }
-
-  // Add wire connections
-  for (const wire of wires) {
-    const k1 = `${wire.fromComponentId}:${wire.fromTerminalId}`;
-    const k2 = `${wire.toComponentId}:${wire.toTerminalId}`;
-    addEdge(k1, k2);
-  }
-
-  // Add internal connections based on component states
-  for (const comp of components) {
-    addInternalComponentConnections(comp, addEdge);
-  }
-
-  const jackTip = `${jack.id}:tip`;
-  const jackSleeve = `${jack.id}:sleeve`;
-
-  // Find all nodes reachable from jack tip and jack sleeve
-  const connectedToTip = getConnectedNodes(jackTip, adj);
-  const connectedToGround = getConnectedNodes(jackSleeve, adj);
-
-  // Check for short circuit
-  if (connectedToTip.has(jackSleeve)) {
+  // 1. Check for true galvanic short circuit (wires, closed switches, ground lugs, resistors < 100 Ohm)
+  if (checkDirectShortCircuit(state)) {
     issues.push('⚠ Short circuit detected: Jack Tip is directly connected to Ground.');
     return createSilentResult(issues);
   }
 
-  // Find all pickups and determine which coils are active
-  const activeCoils: ActiveCoilInfo[] = [];
-  const activePickupsMap = new Map<string, { id: string; name: string; position?: string; type: any }>();
-
-  // Candidates for series inter-pickup evaluation
-  interface PickupCandidate {
-    comp: CircuitComponent;
-    leadA: string;
-    leadB: string;
-    rK: number;
-    indH: number;
-    isHumbucker: boolean;
-    isSeriesLinked?: boolean;
-    isCoilSplit?: boolean;
-    splitCoilName?: string;
-  }
-  const pickupCandidates: PickupCandidate[] = [];
-
-  // Check each pickup
-  for (const comp of components) {
-    if (comp.type === 'pickup-humbucker') {
-      const humbuckerCoils = evaluateHumbucker(comp, connectedToTip, connectedToGround, adj);
-      if (humbuckerCoils.length > 0) {
-        activePickupsMap.set(comp.id, {
-          id: comp.id,
-          name: comp.name,
-          position: comp.properties.pickupPosition,
-          type: comp.type,
-        });
-        activeCoils.push(...humbuckerCoils);
-      } else {
-        const cid = comp.id;
-        const nStart = `${cid}:north-start`;
-        const nFin = `${cid}:north-finish`;
-        const sFin = `${cid}:south-finish`;
-        const sStart = `${cid}:south-start`;
-        const nFinNeighbors = getConnectedNodes(nFin, adj);
-        const isSeriesLinked = nFinNeighbors.has(sFin) && !connectedToGround.has(nFin) && !connectedToTip.has(nFin) && !nFinNeighbors.has(sStart) && !nFinNeighbors.has(nStart);
-        const rK = comp.properties.dcResistanceK ?? 8.4;
-        const indH = comp.properties.inductanceH ?? 4.2;
-        if (isSeriesLinked) {
-          pickupCandidates.push({
-            comp,
-            leadA: nStart,
-            leadB: sStart,
-            rK,
-            indH,
-            isHumbucker: true,
-            isSeriesLinked: true,
-          });
-        } else {
-          // Coil split candidates for humbuckers in series mode
-          pickupCandidates.push({
-            comp,
-            leadA: nStart,
-            leadB: nFin,
-            rK: rK / 2,
-            indH: indH / 2,
-            isHumbucker: true,
-            isCoilSplit: true,
-            splitCoilName: 'North Slug Coil',
-          });
-          pickupCandidates.push({
-            comp,
-            leadA: sStart,
-            leadB: sFin,
-            rK: rK / 2,
-            indH: indH / 2,
-            isHumbucker: true,
-            isCoilSplit: true,
-            splitCoilName: 'South Screw Coil',
-          });
-        }
-      }
-    } else if (
-      comp.type === 'pickup-singlecoil' ||
-      comp.type === 'pickup-p90' ||
-      comp.type === 'pickup-tele-bridge'
-    ) {
-      const coil = evaluateSingleCoil(comp, connectedToTip, connectedToGround, adj);
-      if (coil) {
-        activePickupsMap.set(comp.id, {
-          id: comp.id,
-          name: comp.name,
-          position: comp.properties.pickupPosition,
-          type: comp.type,
-        });
-        activeCoils.push(coil);
-      } else {
-        pickupCandidates.push({
-          comp,
-          leadA: `${comp.id}:hot`,
-          leadB: `${comp.id}:ground`,
-          rK: comp.properties.dcResistanceK ?? 6.2,
-          indH: comp.properties.inductanceH ?? 2.8,
-          isHumbucker: false,
-        });
-      }
-    } else if (comp.type === 'pickup-tele-neck') {
-      const coil = evaluateTeleNeck(comp, connectedToTip, connectedToGround, adj);
-      if (coil) {
-        activePickupsMap.set(comp.id, {
-          id: comp.id,
-          name: comp.name,
-          position: comp.properties.pickupPosition,
-          type: comp.type,
-        });
-        activeCoils.push(coil);
-      } else {
-        pickupCandidates.push({
-          comp,
-          leadA: `${comp.id}:hot`,
-          leadB: `${comp.id}:ground`,
-          rK: comp.properties.dcResistanceK ?? 7.4,
-          indH: comp.properties.inductanceH ?? 2.6,
-          isHumbucker: false,
-        });
-      }
-    }
+  // 2. Run full-band MNA AC sweep with actual component values, plus a quick open-pot reference sweep
+  const actualSweep = solveCircuitMNA(state, BODE_FREQS);
+  if (!actualSweep) {
+    return createSilentResult(['No 1/4" Output Jack placed on canvas.']);
   }
 
-  // Check for pairs of pickups connected in SERIES across Tip and Ground
-  let isInterPickupSeries = false;
-  if (activeCoils.length === 0 && pickupCandidates.length >= 2) {
-    for (let i = 0; i < pickupCandidates.length; i++) {
-      for (let j = 0; j < pickupCandidates.length; j++) {
-        if (i === j) continue;
-        const p1 = pickupCandidates[i];
-        const p2 = pickupCandidates[j];
-        if (p1.comp.id === p2.comp.id) continue;
-
-        const p1Leads = [
-          { tipLead: p1.leadA, juncLead: p1.leadB, reversed: false },
-          { tipLead: p1.leadB, juncLead: p1.leadA, reversed: true },
-        ];
-        const p2Leads = [
-          { juncLead: p2.leadA, gndLead: p2.leadB, reversed: false },
-          { juncLead: p2.leadB, gndLead: p2.leadA, reversed: true },
-        ];
-
-        let matched = false;
-        for (const l1 of p1Leads) {
-          if (!connectedToTip.has(l1.tipLead)) continue;
-          if (connectedToGround.has(l1.juncLead)) continue;
-
-          for (const l2 of p2Leads) {
-            if (!connectedToGround.has(l2.gndLead)) continue;
-            if (connectedToGround.has(l2.juncLead)) continue;
-
-            const juncReach = getConnectedNodes(l1.juncLead, adj);
-            if (juncReach.has(l2.juncLead)) {
-              isInterPickupSeries = true;
-              matched = true;
-
-              // Register p1
-              activePickupsMap.set(p1.comp.id, {
-                id: p1.comp.id,
-                name: p1.comp.name,
-                position: p1.comp.properties.pickupPosition,
-                type: p1.comp.type,
-              });
-              if (p1.isHumbucker) {
-                const isFlipped = !!p1.comp.properties.magnetFlipped;
-                if (p1.isCoilSplit && p1.splitCoilName) {
-                  const isNorth = p1.splitCoilName === 'North Slug Coil';
-                  activeCoils.push({
-                    pickupId: p1.comp.id,
-                    pickupName: p1.comp.name,
-                    coilName: p1.splitCoilName,
-                    magneticPolarity: isNorth ? (isFlipped ? 'South' : 'North') : (isFlipped ? 'North' : 'South'),
-                    electricalPhase: l1.reversed ? 'Reverse-Phase' : 'In-Phase',
-                    dcResistanceK: p1.rK,
-                    inductanceH: p1.indH,
-                  });
-                } else {
-                  activeCoils.push(
-                    {
-                      pickupId: p1.comp.id,
-                      pickupName: p1.comp.name,
-                      coilName: 'North Slug Coil',
-                      magneticPolarity: isFlipped ? 'South' : 'North',
-                      electricalPhase: l1.reversed ? 'Reverse-Phase' : 'In-Phase',
-                      dcResistanceK: p1.rK / 2,
-                      inductanceH: p1.indH / 2,
-                    },
-                    {
-                      pickupId: p1.comp.id,
-                      pickupName: p1.comp.name,
-                      coilName: 'South Screw Coil',
-                      magneticPolarity: isFlipped ? 'North' : 'South',
-                      electricalPhase: l1.reversed ? 'In-Phase' : 'Reverse-Phase',
-                      dcResistanceK: p1.rK / 2,
-                      inductanceH: p1.indH / 2,
-                    }
-                  );
-                }
-              } else {
-                const isRwrp = !!p1.comp.properties.rwrp;
-                activeCoils.push({
-                  pickupId: p1.comp.id,
-                  pickupName: p1.comp.name,
-                  coilName: p1.comp.name,
-                  magneticPolarity: isRwrp ? 'South' : 'North',
-                  electricalPhase: l1.reversed ? (isRwrp ? 'In-Phase' : 'Reverse-Phase') : (isRwrp ? 'Reverse-Phase' : 'In-Phase'),
-                  dcResistanceK: p1.rK,
-                  inductanceH: p1.indH,
-                });
-              }
-
-              // Register p2
-              activePickupsMap.set(p2.comp.id, {
-                id: p2.comp.id,
-                name: p2.comp.name,
-                position: p2.comp.properties.pickupPosition,
-                type: p2.comp.type,
-              });
-              if (p2.isHumbucker) {
-                const isFlipped = !!p2.comp.properties.magnetFlipped;
-                if (p2.isCoilSplit && p2.splitCoilName) {
-                  const isNorth = p2.splitCoilName === 'North Slug Coil';
-                  activeCoils.push({
-                    pickupId: p2.comp.id,
-                    pickupName: p2.comp.name,
-                    coilName: p2.splitCoilName,
-                    magneticPolarity: isNorth ? (isFlipped ? 'South' : 'North') : (isFlipped ? 'North' : 'South'),
-                    electricalPhase: l2.reversed ? 'Reverse-Phase' : 'In-Phase',
-                    dcResistanceK: p2.rK,
-                    inductanceH: p2.indH,
-                  });
-                } else {
-                  activeCoils.push(
-                    {
-                      pickupId: p2.comp.id,
-                      pickupName: p2.comp.name,
-                      coilName: 'North Slug Coil',
-                      magneticPolarity: isFlipped ? 'South' : 'North',
-                      electricalPhase: l2.reversed ? 'Reverse-Phase' : 'In-Phase',
-                      dcResistanceK: p2.rK / 2,
-                      inductanceH: p2.indH / 2,
-                    },
-                    {
-                      pickupId: p2.comp.id,
-                      pickupName: p2.comp.name,
-                      coilName: 'South Screw Coil',
-                      magneticPolarity: isFlipped ? 'North' : 'South',
-                      electricalPhase: l2.reversed ? 'In-Phase' : 'Reverse-Phase',
-                      dcResistanceK: p2.rK / 2,
-                      inductanceH: p2.indH / 2,
-                    }
-                  );
-                }
-              } else {
-                const isRwrp = !!p2.comp.properties.rwrp;
-                activeCoils.push({
-                  pickupId: p2.comp.id,
-                  pickupName: p2.comp.name,
-                  coilName: p2.comp.name,
-                  magneticPolarity: isRwrp ? 'South' : 'North',
-                  electricalPhase: l2.reversed ? (isRwrp ? 'In-Phase' : 'Reverse-Phase') : (isRwrp ? 'Reverse-Phase' : 'In-Phase'),
-                  dcResistanceK: p2.rK,
-                  inductanceH: p2.indH,
-                });
-              }
-
-              break;
-            }
-          }
-          if (matched) break;
-        }
-        if (matched) break;
-      }
-      if (isInterPickupSeries) break;
-    }
+  const refSweep = solveCircuitMNA(state, REF_FREQS, { potValueOverride: 1.0 });
+  if (!refSweep) {
+    return createSilentResult(['No 1/4" Output Jack placed on canvas.']);
   }
 
-  if (activeCoils.length === 0) {
+  const actualPeaks = getCoilAudioBandPeaks(actualSweep);
+  const refPeaks = getCoilAudioBandPeaks(refSweep);
+
+  const maxActualPeak = actualPeaks.reduce((a, b) => Math.max(a, b), 0);
+  const maxRefPeak = refPeaks.reduce((a, b) => Math.max(a, b), 0);
+
+  // If no coil has output even with all volume/tone pots wide open at 10, no pickup is connected
+  if (maxActualPeak < COIL_ACTIVE_ABS_MIN && maxRefPeak < COIL_ACTIVE_ABS_MIN) {
     return createSilentResult([
       'No pickups currently connected to the output path. Check selector switch position or volume pot.',
     ]);
   }
 
-  // Determine series vs parallel wiring configuration
+  const isMutedByPot = maxActualPeak < COIL_ACTIVE_ABS_MIN;
+  const detectionSweep = isMutedByPot ? refSweep : actualSweep;
+  const detectionPeaks = isMutedByPot ? refPeaks : actualPeaks;
+  const maxDetPeak = isMutedByPot ? maxRefPeak : maxActualPeak;
+
+  // 3. Identify active coils & their electrical polarity directly from MNA transfer functions
+  const activeCoilIndices: number[] = [];
+  const coilPolaritySigns = new Map<number, 1 | -1>();
+  const activeThreshold = Math.max(COIL_ACTIVE_ABS_MIN, COIL_ACTIVE_REL_MIN * maxDetPeak);
+
+  for (let ci = 0; ci < detectionSweep.coils.length; ci++) {
+    if (detectionPeaks[ci] >= activeThreshold) {
+      activeCoilIndices.push(ci);
+      const pol = determineCoilPolaritySign(detectionSweep.transfers[ci], detectionSweep.freqs);
+      coilPolaritySigns.set(ci, pol);
+    }
+  }
+
+  if (activeCoilIndices.length === 0) {
+    return createSilentResult([
+      'No pickups currently connected to the output path. Check selector switch position or volume pot.',
+    ]);
+  }
+
+  // Group active coil indices by pickup
+  const activePickupIdsOrdered: string[] = [];
+  const pickupCoilIndices = new Map<string, number[]>();
+  const activePickupsMap = new Map<
+    string,
+    { id: string; name: string; position?: string; type: CircuitComponent['type'] }
+  >();
+
+  for (const ci of activeCoilIndices) {
+    const c = detectionSweep.coils[ci];
+    if (!pickupCoilIndices.has(c.pickupId)) {
+      pickupCoilIndices.set(c.pickupId, []);
+      activePickupIdsOrdered.push(c.pickupId);
+      activePickupsMap.set(c.pickupId, {
+        id: c.pickupId,
+        name: c.pickupName,
+        position: c.pickupPosition,
+        type: c.pickupType,
+      });
+    }
+    pickupCoilIndices.get(c.pickupId)!.push(ci);
+  }
+
+  // 4. Detect series vs parallel topology via MNA open-circuit coupling test
+  const topoOptions = isMutedByPot ? { potValueOverride: 1.0 } : {};
+  const topoBase = solveCircuitMNA(state, TOPOLOGY_PROBE_FREQS, topoOptions)!;
+  const topoBaseMax = topoBase.coils.map((_, ci) =>
+    Math.max(cMag(topoBase.transfers[ci][0]), cMag(topoBase.transfers[ci][1]))
+  );
+
+  // Check intra-humbucker series vs parallel
+  const humbuckerInternalSeries = new Map<string, boolean>();
+  for (const [puId, indices] of pickupCoilIndices) {
+    const pu = compMap.get(puId);
+    if (pu?.type === 'pickup-humbucker' && indices.length === 2) {
+      const [c0, c1] = indices;
+      const testOpen0 = solveCircuitMNA(state, TOPOLOGY_PROBE_FREQS, {
+        ...topoOptions,
+        openCoilIds: new Set([topoBase.coils[c0].id]),
+      });
+      const testOpen1 = solveCircuitMNA(state, TOPOLOGY_PROBE_FREQS, {
+        ...topoOptions,
+        openCoilIds: new Set([topoBase.coils[c1].id]),
+      });
+      const c1AfterOpen0 = testOpen0
+        ? Math.max(cMag(testOpen0.transfers[c1][0]), cMag(testOpen0.transfers[c1][1]))
+        : 0;
+      const c0AfterOpen1 = testOpen1
+        ? Math.max(cMag(testOpen1.transfers[c0][0]), cMag(testOpen1.transfers[c0][1]))
+        : 0;
+
+      // In series, opening one coil breaks or severely drops the other coil's path to the jack
+      const drops1 = topoBaseMax[c1] > 1e-4 && c1AfterOpen0 < 0.45 * topoBaseMax[c1];
+      const drops0 = topoBaseMax[c0] > 1e-4 && c0AfterOpen1 < 0.45 * topoBaseMax[c0];
+      humbuckerInternalSeries.set(puId, drops0 || drops1);
+    }
+  }
+
+  // Check inter-pickup series vs parallel
+  let seriesLinksCount = 0;
+  let totalPickupPairs = 0;
+  if (activePickupIdsOrdered.length >= 2) {
+    for (let i = 0; i < activePickupIdsOrdered.length; i++) {
+      const puA = activePickupIdsOrdered[i];
+      const coilsA = pickupCoilIndices.get(puA)!;
+      const openSet = new Set(coilsA.map((ci) => topoBase.coils[ci].id));
+      const testOpenA = solveCircuitMNA(state, TOPOLOGY_PROBE_FREQS, {
+        ...topoOptions,
+        openCoilIds: openSet,
+      });
+
+      for (let j = i + 1; j < activePickupIdsOrdered.length; j++) {
+        totalPickupPairs++;
+        const puB = activePickupIdsOrdered[j];
+        const coilsB = pickupCoilIndices.get(puB)!;
+        let bDropped = false;
+        if (testOpenA) {
+          for (const ciB of coilsB) {
+            const afterM = Math.max(
+              cMag(testOpenA.transfers[ciB][0]),
+              cMag(testOpenA.transfers[ciB][1])
+            );
+            if (topoBaseMax[ciB] > 1e-4 && afterM < 0.45 * topoBaseMax[ciB]) {
+              bDropped = true;
+              break;
+            }
+          }
+        }
+        if (bDropped) {
+          seriesLinksCount++;
+        } else {
+          // Also test opening B to see if A depends on B (e.g. half-series cap across B)
+          const openSetB = new Set(coilsB.map((ci) => topoBase.coils[ci].id));
+          const testOpenB = solveCircuitMNA(state, TOPOLOGY_PROBE_FREQS, {
+            ...topoOptions,
+            openCoilIds: openSetB,
+          });
+          if (testOpenB) {
+            for (const ciA of coilsA) {
+              const afterM = Math.max(
+                cMag(testOpenB.transfers[ciA][0]),
+                cMag(testOpenB.transfers[ciA][1])
+              );
+              if (topoBaseMax[ciA] > 1e-4 && afterM < 0.45 * topoBaseMax[ciA]) {
+                seriesLinksCount++;
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const isInterPickupSeries = totalPickupPairs > 0 && seriesLinksCount === totalPickupPairs;
+  const isInterPickupComplex =
+    totalPickupPairs > 0 && seriesLinksCount > 0 && seriesLinksCount < totalPickupPairs;
+
+  // Build ActiveCoilInfo[] with accurate names, polarities, and electrical phases
+  const activeCoils: ActiveCoilInfo[] = [];
+  let isCoilSplit = false;
+
+  for (const ci of activeCoilIndices) {
+    const c = detectionSweep.coils[ci];
+    const pol = coilPolaritySigns.get(ci) ?? 1;
+    const electricalPhase: 'In-Phase' | 'Reverse-Phase' =
+      pol > 0
+        ? c.normalElectricalPhase
+        : c.normalElectricalPhase === 'In-Phase'
+        ? 'Reverse-Phase'
+        : 'In-Phase';
+
+    let coilName = 'Single Coil';
+    if (c.pickupType === 'pickup-humbucker') {
+      const puCoils = pickupCoilIndices.get(c.pickupId) || [];
+      const isSingleActiveBobbin = puCoils.length === 1;
+      const isPar = puCoils.length === 2 && !humbuckerInternalSeries.get(c.pickupId);
+      if (isSingleActiveBobbin) isCoilSplit = true;
+
+      if (c.bobbin === 'north') {
+        coilName = isPar
+          ? 'North Slug Coil (Parallel)'
+          : isSingleActiveBobbin
+          ? 'North Slug Coil (Coil-Split)'
+          : 'North Slug Coil';
+      } else {
+        coilName = isPar
+          ? 'South Screw Coil (Parallel)'
+          : isSingleActiveBobbin
+          ? 'South Screw Coil (Coil-Split)'
+          : 'South Screw Coil';
+      }
+    } else if (c.pickupType === 'pickup-tele-neck') {
+      coilName = pol > 0 ? 'Tele Neck (Chrome Shielded)' : 'Tele Neck (Phase Inverted)';
+    } else {
+      const pu = compMap.get(c.pickupId);
+      const isRwrp = !!pu?.properties.rwrp;
+      if (pol > 0) {
+        coilName = isRwrp ? 'Single Coil (RWRP)' : 'Single Coil';
+      } else {
+        coilName = isRwrp ? 'Single Coil (RWRP Rev)' : 'Single Coil (Phase Inverted)';
+      }
+    }
+
+    activeCoils.push({
+      pickupId: c.pickupId,
+      pickupName: c.pickupName,
+      coilName,
+      magneticPolarity: c.magneticPolarity,
+      electricalPhase,
+      dcResistanceK: c.dcResistanceK,
+      inductanceH: c.inductanceH,
+    });
+  }
+
+  // Determine overall wiringConfiguration
   let wiringConfig: 'solo' | 'parallel' | 'series' | 'complex' | 'none' = 'solo';
   if (activeCoils.length === 1) {
     wiringConfig = 'solo';
+  } else if (activePickupIdsOrdered.length === 1) {
+    const puId = activePickupIdsOrdered[0];
+    wiringConfig = humbuckerInternalSeries.get(puId) ? 'series' : 'parallel';
   } else if (isInterPickupSeries) {
     wiringConfig = 'series';
+  } else if (isInterPickupComplex) {
+    wiringConfig = 'complex';
   } else {
-    // Check if coils are connected in series or parallel
-    const isSeries = detectSeriesConfiguration(activeCoils, adj, connectedToGround, connectedToTip);
-    wiringConfig = isSeries ? 'series' : 'parallel';
+    wiringConfig = 'parallel';
   }
 
-  // Phase and Hum Cancellation Analysis
+  // 5. Phase and Hum Cancellation Analysis
   let isHumCancelling = false;
   let humReason = '';
   let phaseRelationship: 'in-phase' | 'out-of-phase' | 'solo' | 'silent' = 'in-phase';
@@ -379,11 +456,7 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
     const c1 = activeCoils[0];
     const c2 = activeCoils[1];
 
-    // Hum Cancellation Condition:
-    // Hum cancels if electrical phase is opposite (one CCW / reverse-wound, one CW / normal)
     const oppositeWinding = c1.electricalPhase !== c2.electricalPhase;
-    const oppositeMagnets = c1.magneticPolarity !== c2.magneticPolarity;
-
     if (oppositeWinding) {
       isHumCancelling = true;
       humReason = 'Hum-cancelling active! Reverse-wound / opposite electrical polarity cancels 60Hz EMI.';
@@ -392,11 +465,10 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
       humReason = 'Both coils have matching electrical polarity — 60Hz hum is additive (not cancelled).';
     }
 
-    // String Signal Phase Condition:
-    // String vibration signal = (Magnetic Polarity) * (Electrical Phase)
-    // +1 for North, -1 for South; +1 for In-Phase, -1 for Reverse-Phase
-    const sign1 = (c1.magneticPolarity === 'North' ? 1 : -1) * (c1.electricalPhase === 'In-Phase' ? 1 : -1);
-    const sign2 = (c2.magneticPolarity === 'North' ? 1 : -1) * (c2.electricalPhase === 'In-Phase' ? 1 : -1);
+    const sign1 =
+      (c1.magneticPolarity === 'North' ? 1 : -1) * (c1.electricalPhase === 'In-Phase' ? 1 : -1);
+    const sign2 =
+      (c2.magneticPolarity === 'North' ? 1 : -1) * (c2.electricalPhase === 'In-Phase' ? 1 : -1);
 
     if (sign1 * sign2 > 0) {
       phaseRelationship = 'in-phase';
@@ -405,7 +477,6 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
       humReason += ' ⚡ Notice: Pickups are OUT OF PHASE (Peter Green hollow nasal acoustic cancellation).';
     }
   } else {
-    // 3 or more coils (e.g. Strat pos 2/4 or dual humbuckers)
     const northCount = activeCoils.filter((c) => c.magneticPolarity === 'North').length;
     const southCount = activeCoils.filter((c) => c.magneticPolarity === 'South').length;
     const inPhaseCount = activeCoils.filter((c) => c.electricalPhase === 'In-Phase').length;
@@ -419,9 +490,7 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
       humReason = 'Unbalanced coils — residual 60Hz hum present.';
     }
 
-    // Check if 2 distinct pickups are active (e.g. dual humbuckers) to evaluate acoustic phase
-    const activePickupIds = Array.from(new Set(activeCoils.map((c) => c.pickupId)));
-    if (activePickupIds.length === 2) {
+    if (activePickupIdsOrdered.length === 2) {
       const getPuSign = (puId: string) => {
         const coils = activeCoils.filter((c) => c.pickupId === puId);
         let total = 0;
@@ -433,8 +502,8 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
         return total >= 0 ? 1 : -1;
       };
 
-      const sign1 = getPuSign(activePickupIds[0]);
-      const sign2 = getPuSign(activePickupIds[1]);
+      const sign1 = getPuSign(activePickupIdsOrdered[0]);
+      const sign2 = getPuSign(activePickupIdsOrdered[1]);
 
       if (sign1 * sign2 < 0) {
         phaseRelationship = 'out-of-phase';
@@ -447,37 +516,24 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
     }
   }
 
-  // Calculate equivalent RLC electrical properties
-  let totalL = 0;
-  let totalR = 0;
-
-  // Group active coils by pickup to compute per-pickup equivalent L and R
-  const pickupCoilGroups = new Map<string, ActiveCoilInfo[]>();
-  for (const coil of activeCoils) {
-    if (!pickupCoilGroups.has(coil.pickupId)) {
-      pickupCoilGroups.set(coil.pickupId, []);
-    }
-    pickupCoilGroups.get(coil.pickupId)!.push(coil);
-  }
-
-  // Calculate each pickup's L and R (internal coils in humbucker can be series, parallel, or split)
+  // 6. Equivalent pickup RLC (DC resistance & inductance)
   const pickupEquivs: { L: number; R: number }[] = [];
-  for (const [puId, pCoils] of pickupCoilGroups) {
+  let totalPickupCapPf = 0;
+
+  for (const [puId, indices] of pickupCoilIndices) {
     const pu = compMap.get(puId);
+    const pCoils = indices.map((ci) => detectionSweep.coils[ci]);
     let pL = 0;
     let pR = 0;
+
     if (pCoils.length === 1) {
-      // Single active coil (e.g. Strat single-coil or Humbucker coil-split)
       pL = pCoils[0].inductanceH;
       pR = pCoils[0].dcResistanceK;
     } else if (pu?.type === 'pickup-humbucker') {
-      const isInternalSeries = detectSeriesConfiguration(pCoils, adj, connectedToGround, connectedToTip);
-      if (isInternalSeries) {
-        // Coils in series: inductances and resistances add
+      if (humbuckerInternalSeries.get(puId)) {
         pL = pCoils.reduce((sum, c) => sum + c.inductanceH, 0);
         pR = pCoils.reduce((sum, c) => sum + c.dcResistanceK, 0);
       } else {
-        // Coils in parallel: inductances and resistances in parallel
         const invL = pCoils.reduce((sum, c) => sum + 1 / Math.max(0.1, c.inductanceH), 0);
         pL = 1 / Math.max(0.001, invL);
         const invR = pCoils.reduce((sum, c) => sum + 1 / Math.max(0.1, c.dcResistanceK), 0);
@@ -487,9 +543,20 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
       pL = pCoils.reduce((sum, c) => sum + c.inductanceH, 0);
       pR = pCoils.reduce((sum, c) => sum + c.dcResistanceK, 0);
     }
+
     pickupEquivs.push({ L: pL, R: pR });
+
+    if (pu?.type === 'pickup-humbucker') {
+      if (pCoils.length === 1) totalPickupCapPf += 80;
+      else if (!humbuckerInternalSeries.get(puId)) totalPickupCapPf += 160;
+      else totalPickupCapPf += pu.properties.capacitancePf ?? 145;
+    } else if (pCoils.length > 0) {
+      totalPickupCapPf += pCoils[0].capacitancePf;
+    }
   }
 
+  let totalL = 0;
+  let totalR = 0;
   if (pickupEquivs.length === 1) {
     totalL = pickupEquivs[0].L;
     totalR = pickupEquivs[0].R;
@@ -497,67 +564,15 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
     totalL = pickupEquivs.reduce((sum, p) => sum + p.L, 0);
     totalR = pickupEquivs.reduce((sum, p) => sum + p.R, 0);
   } else {
-    // Parallel configuration between pickups
     const invL = pickupEquivs.reduce((sum, p) => sum + 1 / Math.max(0.1, p.L), 0);
     totalL = 1 / Math.max(0.001, invL);
     const invR = pickupEquivs.reduce((sum, p) => sum + 1 / Math.max(0.1, p.R), 0);
     totalR = 1 / Math.max(0.001, invR);
   }
 
-  // Helper to build graph with optional component exclusion
-  function buildAdjGraph(excludedCompId?: string) {
-    const graph = new Map<string, Set<string>>();
-    function addGEdge(a: string, b: string) {
-      if (!graph.has(a)) graph.set(a, new Set());
-      if (!graph.has(b)) graph.set(b, new Set());
-      graph.get(a)!.add(b);
-      graph.get(b)!.add(a);
-    }
-    for (const wire of wires) {
-      addGEdge(`${wire.fromComponentId}:${wire.fromTerminalId}`, `${wire.toComponentId}:${wire.toTerminalId}`);
-    }
-    for (const comp of components) {
-      if (comp.id === excludedCompId) continue;
-      addInternalComponentConnections(comp, addGEdge);
-    }
-    return graph;
-  }
-
-  // Pure wire adjacency (physical external wires only, no component internal shortcuts)
-  const wireAdj = new Map<string, Set<string>>();
-  for (const wire of wires) {
-    const k1 = `${wire.fromComponentId}:${wire.fromTerminalId}`;
-    const k2 = `${wire.toComponentId}:${wire.toTerminalId}`;
-    if (!wireAdj.has(k1)) wireAdj.set(k1, new Set());
-    if (!wireAdj.has(k2)) wireAdj.set(k2, new Set());
-    wireAdj.get(k1)!.add(k2);
-    wireAdj.get(k2)!.add(k1);
-  }
-  function getWiredTerminals(startNode: string): Set<string> {
-    const visited = new Set<string>();
-    const queue = [startNode];
-    visited.add(startNode);
-    while (queue.length > 0) {
-      const curr = queue.shift()!;
-      const nbs = wireAdj.get(curr);
-      if (nbs) {
-        for (const n of nbs) {
-          if (!visited.has(n)) {
-            visited.add(n);
-            queue.push(n);
-          }
-        }
-      }
-    }
-    return visited;
-  }
-
-  // Identify Active Volume Pots and Active Tone Pots
+  // 7. Identify Active Volume Pots and Active Tone Pots via MNA sensitivity probes
   const activeVolPotIds: string[] = [];
   const activeTonePotIds: string[] = [];
-  const activeVolPots: { id: string; val: number; taper: string; rK: number }[] = [];
-  const activeTonePots: { id: string; val: number; rK: number; capUf: number }[] = [];
-
   const pots = components.filter(
     (c) =>
       c.type === 'pot-standard' ||
@@ -565,236 +580,297 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
       c.type === 'pot-stacked' ||
       c.type === 'pot-blend'
   );
-  const caps = components.filter((c) => c.type === 'capacitor');
+
+  const isOutOfPhase = phaseRelationship === 'out-of-phase';
+  const potBaseSweep = solveCircuitMNA(state, POT_PROBE_FREQS, { potValueOverride: 1.0 });
+  const potBaseMags = potBaseSweep
+    ? combineElectricalSweep(potBaseSweep, activeCoilIndices, coilPolaritySigns, isOutOfPhase)
+    : [0, 0];
 
   for (const pot of pots) {
-    const isStacked = pot.type === 'pot-stacked';
-    const isBlend = pot.type === 'pot-blend';
-    const lug1 = isStacked ? `${pot.id}:a-lug-1` : `${pot.id}:lug-1`;
-    const lug2 = isStacked ? `${pot.id}:a-lug-2` : `${pot.id}:lug-2`;
-    const lug3 = isStacked ? `${pot.id}:a-lug-3` : `${pot.id}:lug-3`;
-    const potLugs = isStacked
-      ? [lug1, lug2, lug3, `${pot.id}:b-lug-1`, `${pot.id}:b-lug-2`, `${pot.id}:b-lug-3`]
-      : isBlend
-      ? [
-          `${pot.id}:a-in`,
-          `${pot.id}:a-wiper`,
-          `${pot.id}:a-ground`,
-          `${pot.id}:a-gnd`,
-          `${pot.id}:b-in`,
-          `${pot.id}:b-wiper`,
-          `${pot.id}:b-ground`,
-          `${pot.id}:b-gnd`,
-        ]
-      : [lug1, lug2, lug3];
+    if (pot.type === 'pot-blend') {
+      const b0 = solveCircuitMNA(state, [400], {
+        potValueOverride: 1.0,
+        potValueOverrides: new Map([[pot.id, 0.0]]),
+      });
+      const b1 = solveCircuitMNA(state, [400], {
+        potValueOverride: 1.0,
+        potValueOverrides: new Map([[pot.id, 1.0]]),
+      });
+      if (b0 && b1) {
+        let changed = false;
+        for (const ci of activeCoilIndices) {
+          const m0 = cMag(b0.transfers[ci][0]);
+          const m1 = cMag(b1.transfers[ci][0]);
+          if (Math.abs(m0 - m1) > 0.1 * Math.max(m0, m1, 0.01)) {
+            changed = true;
+            break;
+          }
+        }
+        if (changed) activeVolPotIds.push(pot.id);
+      }
+      continue;
+    }
 
-    // Check if this pot has a ground connection
-    const isGrounded = isBlend
-      ? connectedToGround.has(`${pot.id}:a-ground`) ||
-        connectedToGround.has(`${pot.id}:b-ground`) ||
-        connectedToGround.has(`${pot.id}:a-gnd`) ||
-        connectedToGround.has(`${pot.id}:b-gnd`) ||
-        connectedToGround.has(`${pot.id}:case-ground`)
-      : connectedToGround.has(lug1) || connectedToGround.has(lug3);
+    const overrides = new Map<string, number>([[pot.id, 0.0]]);
+    const probeSweep = solveCircuitMNA(state, POT_PROBE_FREQS, {
+      potValueOverride: 1.0,
+      potValueOverrides: overrides,
+    });
+    if (!probeSweep) continue;
+    const probeMags = combineElectricalSweep(
+      probeSweep,
+      activeCoilIndices,
+      coilPolaritySigns,
+      isOutOfPhase
+    );
 
-    // Build graph without this pot's wiper/track connection
-    const adjWithoutPot = buildAdjGraph(pot.id);
-    const tipWithoutPot = getConnectedNodes(jackTip, adjWithoutPot);
+    const r200 = potBaseMags[0] > 1e-5 ? probeMags[0] / potBaseMags[0] : 1;
+    const r5000 = potBaseMags[1] > 1e-5 ? probeMags[1] / potBaseMags[1] : 1;
 
-    // Check if removing this pot breaks connection from an active pickup to jack tip
-    let breaksActivePickup = false;
-    for (const [puId] of activePickupsMap) {
-      const pu = compMap.get(puId);
-      if (!pu) continue;
-      const hotTerm =
-        pu.type === 'pickup-humbucker'
-          ? (connectedToTip.has(`${pu.id}:north-start`) ? `${pu.id}:north-start` : `${pu.id}:south-start`)
-          : (connectedToTip.has(`${pu.id}:hot`) ? `${pu.id}:hot` : `${pu.id}:ground`);
-      if (connectedToTip.has(hotTerm) && !tipWithoutPot.has(hotTerm)) {
-        breaksActivePickup = true;
+    if (r200 < 0.15) {
+      activeVolPotIds.push(pot.id);
+    } else if (r5000 < 0.72 || r200 < 0.72) {
+      activeTonePotIds.push(pot.id);
+    }
+  }
+
+  // 8. Compute combined MNA frequency response (actual + tone-open reference)
+  const actualCurveMags = combineElectricalSweep(
+    actualSweep,
+    activeCoilIndices,
+    coilPolaritySigns,
+    isOutOfPhase
+  );
+
+  // Check if any active tone pot is rolled down below 1.0
+  const hasRolledTonePot = activeTonePotIds.some((id) => {
+    const p = compMap.get(id);
+    if (!p) return false;
+    if (p.type === 'pot-stacked') {
+      return (p.properties.innerValue ?? 1.0) < 0.99 || (p.properties.outerValue ?? 1.0) < 0.99;
+    }
+    return (p.properties.currentValue ?? 1.0) < 0.99;
+  });
+
+  // Reference curve with tone pots wide open (used to isolate pickup resonant f0/Q and tone cutoff)
+  let openToneCurveMags = actualCurveMags;
+  if (hasRolledTonePot && !isMutedByPot) {
+    const toneOpenOverrides = new Map<string, number>();
+    for (const tid of activeTonePotIds) {
+      toneOpenOverrides.set(tid, 1.0);
+    }
+    const openToneSweep = solveCircuitMNA(state, BODE_FREQS, {
+      potValueOverrides: toneOpenOverrides,
+    });
+    if (openToneSweep) {
+      openToneCurveMags = combineElectricalSweep(
+        openToneSweep,
+        activeCoilIndices,
+        coilPolaritySigns,
+        isOutOfPhase
+      );
+    }
+  } else if (isMutedByPot) {
+    // When muted by volume pot at 0, compute open-pot Bode curve to keep resonant f0/Q meaningful
+    const openAllSweep = solveCircuitMNA(state, BODE_FREQS, { potValueOverride: 1.0 });
+    if (openAllSweep) {
+      openToneCurveMags = combineElectricalSweep(
+        openAllSweep,
+        activeCoilIndices,
+        coilPolaritySigns,
+        isOutOfPhase
+      );
+    }
+  }
+
+  // 9. Compute effectiveVolumeLevel directly from MNA ratio vs full-volume reference
+  let effectiveVolumeLevel = 0;
+  if (!isMutedByPot) {
+    const refCurveMags = combineElectricalSweep(
+      refSweep,
+      activeCoilIndices,
+      coilPolaritySigns,
+      isOutOfPhase
+    );
+    const refMax = refCurveMags.reduce((a, b) => Math.max(a, b), 0);
+
+    // Pick lowest passband frequency in [150, 300, 600, 1200] Hz (avoids tone-pot rolloff & resonant peak)
+    let volRefFreq = 300;
+    let volRefMag = refCurveMags[2]; // 300 Hz index in REF_FREQS
+    for (let idx = 1; idx <= 4; idx++) {
+      if (refCurveMags[idx] >= 0.45 * refMax) {
+        volRefFreq = REF_FREQS[idx];
+        volRefMag = refCurveMags[idx];
         break;
       }
     }
 
-    if (breaksActivePickup && (isGrounded || isBlend)) {
-      // Active Volume / Blend Pot
-      const val = pot.properties.currentValue ?? 1.0;
-      const taper = pot.properties.taper ?? 'audio';
-      const rK = pot.properties.resistanceK ?? 500;
-      activeVolPotIds.push(pot.id);
-      activeVolPots.push({ id: pot.id, val, taper, rK });
+    // Find closest bin in BODE_FREQS to volRefFreq
+    let closestBin = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < BODE_FREQS.length; i++) {
+      const d = Math.abs(BODE_FREQS[i] - volRefFreq);
+      if (d < bestDist) {
+        bestDist = d;
+        closestBin = i;
+      }
+    }
+
+    const actualAtRef = openToneCurveMags[closestBin];
+    const ratio = volRefMag > 1e-6 ? actualAtRef / volRefMag : 1.0;
+    if (ratio >= 0.985) {
+      effectiveVolumeLevel = 1.0;
+    } else if (ratio <= 0.01) {
+      effectiveVolumeLevel = 0;
     } else {
-      // Check if it's an Active Tone Pot (series RC shunt to ground off the active signal path)
-      let isTone = false;
-      let toneCapUf = 0.022;
+      effectiveVolumeLevel = Math.round(ratio * 1000) / 1000;
+    }
+  }
 
-      for (const cap of caps) {
-        const capLead1 = `${cap.id}:lead-1`;
-        const capLead2 = `${cap.id}:lead-2`;
+  const hasOutputSignal = !isMutedByPot && effectiveVolumeLevel > 0.01;
 
-        const capLead1Wired = getWiredTerminals(capLead1);
-        const capLead2Wired = getWiredTerminals(capLead2);
-
-        const cap1Gnd = connectedToGround.has(capLead1);
-        const cap2Gnd = connectedToGround.has(capLead2);
-        const cap1Tip = connectedToTip.has(capLead1);
-        const cap2Tip = connectedToTip.has(capLead2);
-
-        // Case A: Cap lead 2 grounded, Cap lead 1 wired to pot lug, other pot lug in tipWithoutPot (active hot path)
-        if (cap2Gnd && !cap1Gnd) {
-          const wiredToCap1 = potLugs.filter((l) => capLead1Wired.has(l));
-          const otherLugsInTip = potLugs.filter((l) => !wiredToCap1.includes(l) && tipWithoutPot.has(l));
-          if (wiredToCap1.length > 0 && otherLugsInTip.length > 0) {
-            isTone = true;
-            toneCapUf = cap.properties.capacitanceUf ?? 0.022;
-            break;
-          }
-        }
-        if (cap1Gnd && !cap2Gnd) {
-          const wiredToCap2 = potLugs.filter((l) => capLead2Wired.has(l));
-          const otherLugsInTip = potLugs.filter((l) => !wiredToCap2.includes(l) && tipWithoutPot.has(l));
-          if (wiredToCap2.length > 0 && otherLugsInTip.length > 0) {
-            isTone = true;
-            toneCapUf = cap.properties.capacitanceUf ?? 0.022;
-            break;
-          }
-        }
-
-        // Case B: Cap lead 1 in tip, Cap lead 2 wired to pot lug, other pot lug grounded (e.g. Gibson '50s wiring)
-        if (cap1Tip && !cap2Tip) {
-          const wiredToCap2 = potLugs.filter((l) => capLead2Wired.has(l));
-          const otherLugsInGnd = potLugs.filter((l) => !wiredToCap2.includes(l) && connectedToGround.has(l));
-          if (wiredToCap2.length > 0 && otherLugsInGnd.length > 0) {
-            isTone = true;
-            toneCapUf = cap.properties.capacitanceUf ?? 0.022;
-            break;
-          }
-        }
-        if (cap2Tip && !cap1Tip) {
-          const wiredToCap1 = potLugs.filter((l) => capLead1Wired.has(l));
-          const otherLugsInGnd = potLugs.filter((l) => !wiredToCap1.includes(l) && connectedToGround.has(l));
-          if (wiredToCap1.length > 0 && otherLugsInGnd.length > 0) {
-            isTone = true;
-            toneCapUf = cap.properties.capacitanceUf ?? 0.022;
-            break;
-          }
-        }
-      }
-
-      if (isTone) {
-        const val = pot.properties.currentValue ?? 1.0;
-        const rK = pot.properties.resistanceK ?? 250;
-        activeTonePotIds.push(pot.id);
-        activeTonePots.push({ id: pot.id, val, rK, capUf: toneCapUf });
+  // 10. Extract resonantFrequencyHz, peakBoostDb, qFactor directly from MNA open-tone sweep
+  // Prefer the primary pickup LC resonance in [1100, 14000] Hz (so dual-resonance tuned-split
+  // circuits report the true upper single-coil peak rather than the ~600Hz series-cap bump).
+  let peakBin = 0;
+  let peakMag = 0;
+  let foundTrebleLocalMax = false;
+  for (let i = 1; i < BODE_FREQS.length - 1; i++) {
+    if (BODE_FREQS[i] < 1100 || BODE_FREQS[i] > 14000) continue;
+    const m = openToneCurveMags[i];
+    if (m >= openToneCurveMags[i - 1] && m >= openToneCurveMags[i + 1] && m > peakMag) {
+      peakMag = m;
+      peakBin = i;
+      foundTrebleLocalMax = true;
+    }
+  }
+  if (!foundTrebleLocalMax) {
+    for (let i = 0; i < BODE_FREQS.length; i++) {
+      if (BODE_FREQS[i] < 450 || BODE_FREQS[i] > 14000) continue;
+      if (openToneCurveMags[i] > peakMag) {
+        peakMag = openToneCurveMags[i];
+        peakBin = i;
       }
     }
   }
 
-  // Calculate Volume Attenuation from active volume pots only
-  let volAttenuation = 1.0;
-  if (activeVolPots.length > 0) {
-    let minFactor = 1.0;
-    for (const vp of activeVolPots) {
-      let factor = vp.val;
-      if (vp.taper === 'audio') {
-        factor = Math.pow(vp.val, 2.5);
-      } else if (vp.taper === 'reverse-audio') {
-        factor = 1 - Math.pow(1 - vp.val, 2.5);
-      }
-      minFactor = Math.min(minFactor, factor);
-    }
-    volAttenuation = Math.max(0.001, minFactor);
-  }
-
-  // Calculate Tone Rolloff from active tone pots only (defaults to 20kHz wide open if no tone pot is active)
-  let toneRolloffHz = 20000;
-  if (activeTonePots.length > 0) {
-    let minCutoff = 20000;
-    for (const tp of activeTonePots) {
-      if (tp.val < 1.0) {
-        const capScaling = Math.sqrt(0.022 / Math.max(0.001, tp.capUf));
-        const lowestHz = Math.round(Math.max(200, Math.min(800, 360 * capScaling)));
-        const highestHz = 18000;
-        const toneFactor = Math.pow(tp.val, 2.0);
-        const cutoff = lowestHz + toneFactor * (highestHz - lowestHz);
-        minCutoff = Math.min(minCutoff, cutoff);
-      }
-    }
-    toneRolloffHz = minCutoff;
-  }
-
-  // Calculate total parallel AC loading resistance from ACTIVE pots and amp input (1M)
-  let invLoadK = 1 / 1000; // 1M standard amp input
-  for (const vp of activeVolPots) {
-    invLoadK += 1 / Math.max(10, vp.rK);
-  }
-  for (const tp of activeTonePots) {
-    invLoadK += 1 / Math.max(10, tp.rK);
-  }
-  const potLoadK = 1 / invLoadK;
-
-  // Calculate pickup self-capacitances and mechanical/eddy-current damping
-  let totalPickupCapPf = 0;
-  let minDamping = 1.0;
-  let isCoilSplit = false;
-
-  for (const [puId, pCoils] of pickupCoilGroups) {
-    const pu = compMap.get(puId);
-    if (!pu) continue;
-    const isSplit = pu.type === 'pickup-humbucker' && pCoils.length === 1;
-    if (isSplit) isCoilSplit = true;
-    const isParHumbucker =
-      pu.type === 'pickup-humbucker' &&
-      pCoils.length === 2 &&
-      !detectSeriesConfiguration(pCoils, adj, connectedToGround, connectedToTip);
-
-    if (pu.type === 'pickup-singlecoil') {
-      totalPickupCapPf += pu.properties.capacitancePf ?? 95;
-      minDamping = Math.min(minDamping, 1.0);
-    } else if (pu.type === 'pickup-tele-neck') {
-      totalPickupCapPf += pu.properties.capacitancePf ?? 120;
-      minDamping = Math.min(minDamping, 0.65); // chrome-plated brass cover eddy current damping
-    } else if (pu.type === 'pickup-tele-bridge') {
-      totalPickupCapPf += pu.properties.capacitancePf ?? 105;
-      minDamping = Math.min(minDamping, 0.88); // steel baseplate damping
-    } else if (pu.type === 'pickup-p90') {
-      totalPickupCapPf += pu.properties.capacitancePf ?? 130;
-      minDamping = Math.min(minDamping, 0.90);
-    } else if (pu.type === 'pickup-humbucker') {
-      if (isSplit) {
-        totalPickupCapPf += 80;
-        minDamping = Math.min(minDamping, 0.95);
-      } else if (isParHumbucker) {
-        totalPickupCapPf += 160;
-        minDamping = Math.min(minDamping, 0.92);
-      } else {
-        totalPickupCapPf += pu.properties.capacitancePf ?? 145;
-        minDamping = Math.min(minDamping, 0.85);
-      }
+  // Parabolic interpolation in log-frequency around peakBin for precise f0
+  let resonantFrequencyHz = Math.round(BODE_FREQS[peakBin] || 3500);
+  if (peakBin > 0 && peakBin < BODE_FREQS.length - 1) {
+    const yL = openToneCurveMags[peakBin - 1];
+    const yC = openToneCurveMags[peakBin];
+    const yR = openToneCurveMags[peakBin + 1];
+    const denom = yL - 2 * yC + yR;
+    if (denom < -1e-9) {
+      const delta = Math.max(-0.5, Math.min(0.5, (0.5 * (yL - yR)) / denom));
+      const logF =
+        Math.log10(BODE_FREQS[peakBin]) +
+        delta * (Math.log10(BODE_FREQS[peakBin + 1]) - Math.log10(BODE_FREQS[peakBin]));
+      resonantFrequencyHz = Math.round(Math.pow(10, logF));
     }
   }
 
-  // Resonant frequency calculation:
-  // f0 = 1 / (2 * pi * sqrt(L * C))
-  const cableCapPf = 450; // standard 10-foot guitar cable capacitance
-  const strayCapPf = 40;  // control cavity and wiring capacitance
-  const totalC_Pf = cableCapPf + strayCapPf + totalPickupCapPf;
-  const totalC_Farads = totalC_Pf * 1e-12;
-  const f0 = 1 / (2 * Math.PI * Math.sqrt(Math.max(0.01, totalL) * totalC_Farads));
-  const resonantFrequencyHz = Math.round(Math.min(12000, Math.max(1200, f0)));
+  // Passband baseline magnitude below resonance:
+  // Use ~180-300 Hz for normal circuits; if a high-pass bass-cut cap rolls off 200 Hz
+  // (monotonically rising toward the peak), sample closer to 0.22 * f0.
+  const findClosestBin = (targetF: number) => {
+    let best = 0;
+    let bestD = Infinity;
+    for (let i = 0; i < BODE_FREQS.length; i++) {
+      const d = Math.abs(BODE_FREQS[i] - targetF);
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    return best;
+  };
 
-  // Physically accurate Q factor calculation:
-  // Q = 1 / (R_coil / (w0 * L) + (w0 * L) / R_load) * minDamping
-  const loadOhms = potLoadK * 1000;
-  const w0 = 2 * Math.PI * resonantFrequencyHz;
-  const coilDamping = (totalR * 1000) / Math.max(100, w0 * totalL);
-  const potDamping = (w0 * totalL) / Math.max(1000, loadOhms);
-  const rawQ = 1 / Math.max(0.12, coilDamping + potDamping);
-  const qFactor = Math.min(7.0, Math.max(0.8, Math.round(rawQ * minDamping * 10) / 10));
-  const peakBoostDb = Math.round(20 * Math.log10(Math.max(1.15, qFactor)) * 10) / 10;
+  const lowBaseBin = findClosestBin(200);
+  const midBaseBin = findClosestBin(Math.max(250, Math.min(900, resonantFrequencyHz * 0.22)));
+  // If curve is monotonically rising from 200 Hz to midBase (series bass-cut cap), use midBaseBin;
+  // otherwise use lowBaseBin (so a secondary tuned-split bump at ~600Hz doesn't inflate baseMag).
+  const isHighPassedLow =
+    openToneCurveMags[lowBaseBin] < 0.85 * openToneCurveMags[midBaseBin] &&
+    openToneCurveMags[findClosestBin(80)] < openToneCurveMags[lowBaseBin];
+  const baseBin = isHighPassedLow ? midBaseBin : lowBaseBin;
+  const baseMag = openToneCurveMags[baseBin];
 
-  // Level offset: series humbucker / series pairs produce higher output EMF (+4dB),
-  // split humbucker produces single bobbin output (-4.5dB)
+  const peakRatio = baseMag > 1e-6 ? peakMag / baseMag : 1.0;
+
+  // Handle overdamped circuits (no resonant peak above passband): find -3 dB upper cutoff
+  if (!foundTrebleLocalMax && peakRatio < 1.04) {
+    let cutoffBin = peakBin;
+    for (let i = baseBin; i < BODE_FREQS.length; i++) {
+      if (openToneCurveMags[i] <= baseMag * 0.7071) {
+        cutoffBin = i;
+        break;
+      }
+    }
+    resonantFrequencyHz = Math.round(
+      Math.min(12000, Math.max(600, BODE_FREQS[cutoffBin] || resonantFrequencyHz))
+    );
+  } else {
+    resonantFrequencyHz = Math.round(Math.min(12000, Math.max(600, resonantFrequencyHz)));
+  }
+
+  // Convert peak ratio to Q factor for a 2nd-order RLC response:
+  // For Q > 1/sqrt(2), peakRatio = Q / sqrt(1 - 1/(4*Q^2))  =>  Q ≈ peakRatio (exact for Q >= 1.2)
+  let rawQ = 0.7;
+  if (peakRatio > 1.02) {
+    // Exact inverse of M_p = Q / sqrt(1 - 1/(4Q^2)):
+    // 4 M_p^2 Q^2 - M_p^2 = 4 Q^4 => Q^2 = (M_p^2 + M_p * sqrt(M_p^2 - 1)) / 2
+    const mpSq = peakRatio * peakRatio;
+    rawQ = Math.sqrt(0.5 * (mpSq + peakRatio * Math.sqrt(Math.max(0, mpSq - 1))));
+  }
+  const qFactor = Math.min(7.0, Math.max(0.5, Math.round(rawQ * 10) / 10));
+  const peakBoostDb = Math.max(0, Math.round(20 * Math.log10(Math.max(1.0, peakRatio)) * 10) / 10);
+
+  // 11. Measure exact effective load resistance (kOhm) from MNA
+  const activeCoilModels: CoilModel[] = activeCoilIndices.map((ci) => detectionSweep.coils[ci]);
+  const loadResistanceK = measureEffectiveLoadResistanceK(
+    state,
+    activeCoilModels,
+    resonantFrequencyHz
+  );
+
+  // 12. Measure effectiveToneCutoffHz when tone pot(s) are rolled down
+  let effectiveToneCutoffHz = 20000;
+  if (hasRolledTonePot && hasOutputSignal) {
+    // Find frequency where actual response drops -3 dB (0.707) relative to open-tone response
+    for (let i = 1; i < BODE_FREQS.length; i++) {
+      if (BODE_FREQS[i] < 180) continue;
+      const openM = openToneCurveMags[i];
+      if (openM < 1e-6) continue;
+      const ratio = actualCurveMags[i] / openM;
+      if (ratio <= 0.7071) {
+        const prevOpen = openToneCurveMags[i - 1];
+        const prevRatio = prevOpen > 1e-6 ? actualCurveMags[i - 1] / prevOpen : 1.0;
+        if (prevRatio > 0.7071 && prevRatio > ratio) {
+          const t = (prevRatio - 0.7071) / (prevRatio - ratio);
+          const logF =
+            Math.log10(BODE_FREQS[i - 1]) +
+            t * (Math.log10(BODE_FREQS[i]) - Math.log10(BODE_FREQS[i - 1]));
+          effectiveToneCutoffHz = Math.round(Math.max(200, Math.min(18000, Math.pow(10, logF))));
+        } else {
+          effectiveToneCutoffHz = Math.round(Math.max(200, Math.min(18000, BODE_FREQS[i])));
+        }
+        break;
+      }
+    }
+  }
+
+  // 13. Build MNA Bode frequency response array for FrequencyResponsePlot
+  const frequencyResponse: { freq: number; db: number }[] = BODE_FREQS.map((freq, idx) => ({
+    freq: Math.round(freq * 10) / 10,
+    db: hasOutputSignal
+      ? Math.round(20 * Math.log10(Math.max(1e-4, actualCurveMags[idx])) * 100) / 100
+      : -60,
+  }));
+
+  const totalC_Pf = CABLE_CAPACITANCE_PF + STRAY_CAPACITANCE_PF + totalPickupCapPf;
+
   let gainOffsetDb = 0;
   if (wiringConfig === 'series') {
     gainOffsetDb = 4.0;
@@ -805,7 +881,7 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
   }
 
   return {
-    hasOutputSignal: volAttenuation > 0.01,
+    hasOutputSignal,
     activePickups: Array.from(activePickupsMap.values()),
     activeCoils,
     wiringConfiguration: wiringConfig,
@@ -816,16 +892,17 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
     estimatedTotalInductanceH: Math.round(totalL * 10) / 10,
     resonantFrequencyHz,
     peakBoostDb,
-    qFactor: Math.round(qFactor * 10) / 10,
-    effectiveVolumeLevel: volAttenuation,
-    effectiveToneCutoffHz: Math.round(toneRolloffHz),
+    qFactor,
+    effectiveVolumeLevel,
+    effectiveToneCutoffHz,
     activeVolumePotIds: activeVolPotIds,
     activeTonePotIds: activeTonePotIds,
     circuitIssues: issues,
-    loadResistanceK: Math.round(potLoadK * 10) / 10,
+    loadResistanceK: Math.round(loadResistanceK * 10) / 10,
     totalCapacitancePf: Math.round(totalC_Pf),
     isCoilSplit,
     gainOffsetDb,
+    frequencyResponse,
   };
 }
 
@@ -849,391 +926,6 @@ function createSilentResult(issues: string[]): CircuitAnalysisResult {
     activeTonePotIds: [],
     circuitIssues: issues,
   };
-}
-
-function addInternalComponentConnections(
-  comp: CircuitComponent,
-  addEdge: (a: string, b: string) => void
-) {
-  const cid = comp.id;
-
-  switch (comp.type) {
-    case 'pot-standard': {
-      // Connect Lug 3 to Lug 2 (wiper) with variable resistance
-      // Volume/tone pots at zero are still considered active circuit participants
-      addEdge(`${cid}:lug-2`, `${cid}:lug-3`);
-      break;
-    }
-
-    case 'pot-pushpull': {
-      // Volume/tone pots at zero are still considered active circuit participants
-      addEdge(`${cid}:lug-2`, `${cid}:lug-3`);
-      // DPDT switch section
-      const isPulled = !!comp.properties.pulledUp;
-      if (isPulled) {
-        // Pulled UP: C1 connects to 2, C2 connects to 4
-        addEdge(`${cid}:sw-c1`, `${cid}:sw-2`);
-        addEdge(`${cid}:sw-c2`, `${cid}:sw-4`);
-      } else {
-        // Pushed DOWN: C1 connects to 1, C2 connects to 3
-        addEdge(`${cid}:sw-c1`, `${cid}:sw-1`);
-        addEdge(`${cid}:sw-c2`, `${cid}:sw-3`);
-      }
-      break;
-    }
-
-    case 'pot-stacked': {
-      addEdge(`${cid}:a-lug-2`, `${cid}:a-lug-3`);
-      addEdge(`${cid}:b-lug-2`, `${cid}:b-lug-3`);
-      break;
-    }
-
-    case 'pot-blend': {
-      addEdge(`${cid}:a-in`, `${cid}:a-wiper`);
-      addEdge(`${cid}:b-in`, `${cid}:b-wiper`);
-      break;
-    }
-
-    case 'switch-3way-toggle': {
-      const pos = comp.properties.switchPosition ?? 1; // 0=Bridge, 1=Both, 2=Neck
-      if (pos === 0 || pos === 1) {
-        addEdge(`${cid}:sw-bridge`, `${cid}:sw-output`);
-      }
-      if (pos === 2 || pos === 1) {
-        addEdge(`${cid}:sw-neck`, `${cid}:sw-output`);
-      }
-      break;
-    }
-
-    case 'switch-5way-blade': {
-      const pos = comp.properties.switchPosition ?? 0;
-      // Pos 0: Neck (Throw 1)
-      // Pos 1: Neck + Mid (Throws 1 & 2)
-      // Pos 2: Mid (Throw 2)
-      // Pos 3: Mid + Bridge (Throws 2 & 3)
-      // Pos 4: Bridge (Throw 3)
-      if (pos === 0) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-1`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-1`);
-      } else if (pos === 1) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-1`);
-        addEdge(`${cid}:p1-c`, `${cid}:p1-2`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-1`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-2`);
-      } else if (pos === 2) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-2`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-2`);
-      } else if (pos === 3) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-2`);
-        addEdge(`${cid}:p1-c`, `${cid}:p1-3`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-2`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-3`);
-      } else if (pos === 4) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-3`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-3`);
-      }
-      break;
-    }
-
-    case 'switch-3way-blade': {
-      const pos = comp.properties.switchPosition ?? 0;
-      // Pos 0: Neck (1), Pos 1: Neck & Bridge (1 & 3), Pos 2: Bridge (3)
-      if (pos === 0) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-1`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-1`);
-      } else if (pos === 1) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-1`);
-        addEdge(`${cid}:p1-c`, `${cid}:p1-3`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-1`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-3`);
-      } else if (pos === 2) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-3`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-3`);
-      }
-      break;
-    }
-
-    case 'switch-4way-blade': {
-      const pos = comp.properties.switchPosition ?? 0;
-      // 0: Bridge, 1: Parallel, 2: Neck, 3: Series
-      addEdge(`${cid}:p1-c`, `${cid}:p1-${pos + 1}`);
-      addEdge(`${cid}:p2-c`, `${cid}:p2-${pos + 1}`);
-      break;
-    }
-
-    case 'switch-superswitch': {
-      const pos = comp.properties.switchPosition ?? 0; // 0 to 4
-      const throwNum = pos + 1;
-      addEdge(`${cid}:pa-c`, `${cid}:pa-${throwNum}`);
-      addEdge(`${cid}:pb-c`, `${cid}:pb-${throwNum}`);
-      addEdge(`${cid}:pc-c`, `${cid}:pc-${throwNum}`);
-      addEdge(`${cid}:pd-c`, `${cid}:pd-${throwNum}`);
-      break;
-    }
-
-    case 'switch-dpdt-minitoggle': {
-      const pos = comp.properties.switchPosition ?? 0; // 0=down, 1=up
-      if (pos === 0) {
-        addEdge(`${cid}:sw-c1`, `${cid}:sw-2`);
-        addEdge(`${cid}:sw-c2`, `${cid}:sw-4`);
-      } else {
-        addEdge(`${cid}:sw-c1`, `${cid}:sw-1`);
-        addEdge(`${cid}:sw-c2`, `${cid}:sw-3`);
-      }
-      break;
-    }
-
-    case 'ground-lug': {
-      // All ground lugs internally connected
-      addEdge(`${cid}:gnd-1`, `${cid}:gnd-2`);
-      addEdge(`${cid}:gnd-2`, `${cid}:gnd-3`);
-      addEdge(`${cid}:gnd-3`, `${cid}:gnd-bridge`);
-      break;
-    }
-
-    case 'capacitor': {
-      // Capacitors block DC and are reactive audio filter components.
-      // Do not add a galvanic connection between leads; doing so shorts tone circuits to ground.
-      break;
-    }
-
-    case 'resistor': {
-      // Connect both leads internally for audio AC continuity
-      addEdge(`${cid}:lead-1`, `${cid}:lead-2`);
-      break;
-    }
-  }
-}
-
-function getConnectedNodes(startNode: string, adj: Map<string, Set<string>>): Set<string> {
-  const visited = new Set<string>();
-  const queue = [startNode];
-  visited.add(startNode);
-
-  while (queue.length > 0) {
-    const current = queue.shift()!;
-    const neighbors = adj.get(current);
-    if (neighbors) {
-      for (const next of neighbors) {
-        if (!visited.has(next)) {
-          visited.add(next);
-          queue.push(next);
-        }
-      }
-    }
-  }
-
-  return visited;
-}
-
-function evaluateHumbucker(
-  comp: CircuitComponent,
-  connectedToTip: Set<string>,
-  connectedToGround: Set<string>,
-  adj: Map<string, Set<string>>
-): ActiveCoilInfo[] {
-  const active: ActiveCoilInfo[] = [];
-  const cid = comp.id;
-  const isFlipped = !!comp.properties.magnetFlipped;
-  const rK = comp.properties.dcResistanceK ?? 8.4;
-  const indH = comp.properties.inductanceH ?? 4.2;
-
-  const nStart = `${cid}:north-start`;
-  const nFinish = `${cid}:north-finish`;
-  const sFinish = `${cid}:south-finish`;
-  const sStart = `${cid}:south-start`;
-
-  // Standard humbucker: North coil (nStart to nFinish), South coil (sFinish to sStart)
-  // Check if North Coil is in active circuit
-  const nStartTip = connectedToTip.has(nStart);
-  const nStartGnd = connectedToGround.has(nStart);
-  const nFinishTip = connectedToTip.has(nFinish);
-  const nFinishGnd = connectedToGround.has(nFinish);
-
-  // Check South Coil
-  const sFinishTip = connectedToTip.has(sFinish);
-  const sFinishGnd = connectedToGround.has(sFinish);
-  const sStartTip = connectedToTip.has(sStart);
-  const sStartGnd = connectedToGround.has(sStart);
-
-  // Check series link: nFinish connected to sFinish
-  const nFinishNeighbors = getConnectedNodes(nFinish, adj);
-  const isSeriesLinked = nFinishNeighbors.has(sFinish);
-
-  // Case 1: Standard Series Humbucker
-  // nStart goes to Tip, sStart goes to Gnd, nFinish connected to sFinish (and not shunted)
-  if (
-    isSeriesLinked &&
-    !nFinishNeighbors.has(`${comp.id}:bare-shield`) &&
-    !connectedToGround.has(nFinish) &&
-    !connectedToTip.has(nFinish) &&
-    ((nStartTip && sStartGnd) || (nStartGnd && sStartTip))
-  ) {
-    const isReversed = nStartGnd && sStartTip;
-    active.push({
-      pickupId: comp.id,
-      pickupName: comp.name,
-      coilName: 'North Slug Coil',
-      magneticPolarity: isFlipped ? 'South' : 'North',
-      electricalPhase: isReversed ? 'Reverse-Phase' : 'In-Phase',
-      dcResistanceK: rK / 2,
-      inductanceH: indH / 2,
-    });
-    active.push({
-      pickupId: comp.id,
-      pickupName: comp.name,
-      coilName: 'South Screw Coil',
-      magneticPolarity: isFlipped ? 'North' : 'South',
-      electricalPhase: isReversed ? 'In-Phase' : 'Reverse-Phase',
-      dcResistanceK: rK / 2,
-      inductanceH: indH / 2,
-    });
-    return active;
-  }
-
-  // Case 2: Coil Split or Parallel to North Coil
-  const isNorthActive = (nStartTip && nFinishGnd) || (nStartGnd && nFinishTip);
-  const isSouthActive =
-    (sFinishTip && sStartGnd) ||
-    (sFinishGnd && sStartTip) ||
-    (sStartTip && sFinishGnd) ||
-    (sStartGnd && sFinishTip);
-
-  const isParallelCoils = isNorthActive && isSouthActive && !isSeriesLinked;
-
-  if (isNorthActive) {
-    active.push({
-      pickupId: comp.id,
-      pickupName: comp.name,
-      coilName: isParallelCoils
-        ? 'North Slug Coil (Parallel)'
-        : isSeriesLinked
-        ? 'North Slug Coil'
-        : 'North Slug Coil (Coil-Split)',
-      magneticPolarity: isFlipped ? 'South' : 'North',
-      electricalPhase: nStartTip ? 'In-Phase' : 'Reverse-Phase',
-      dcResistanceK: rK / 2,
-      inductanceH: indH / 2,
-    });
-  }
-
-  // Case 3: Coil Split or Parallel to South Coil
-  if (isSouthActive) {
-    active.push({
-      pickupId: comp.id,
-      pickupName: comp.name,
-      coilName: isParallelCoils
-        ? 'South Screw Coil (Parallel)'
-        : isSeriesLinked
-        ? 'South Screw Coil'
-        : 'South Screw Coil (Coil-Split)',
-      magneticPolarity: isFlipped ? 'North' : 'South',
-      electricalPhase: sFinishTip || sStartGnd ? 'Reverse-Phase' : 'In-Phase',
-      dcResistanceK: rK / 2,
-      inductanceH: indH / 2,
-    });
-  }
-
-  return active;
-}
-
-function evaluateSingleCoil(
-  comp: CircuitComponent,
-  connectedToTip: Set<string>,
-  connectedToGround: Set<string>,
-  adj: Map<string, Set<string>>
-): ActiveCoilInfo | null {
-  const cid = comp.id;
-  const hot = `${cid}:hot`;
-  const gnd = `${cid}:ground`;
-  const isRwrp = !!comp.properties.rwrp;
-  const rK = comp.properties.dcResistanceK ?? 6.2;
-  const indH = comp.properties.inductanceH ?? 2.8;
-
-  const hotInTip = connectedToTip.has(hot);
-  const hotInGnd = connectedToGround.has(hot);
-  const gndInTip = connectedToTip.has(gnd);
-  const gndInGnd = connectedToGround.has(gnd);
-
-  if (hotInTip && gndInGnd) {
-    return {
-      pickupId: comp.id,
-      pickupName: comp.name,
-      coilName: isRwrp ? 'Single Coil (RWRP)' : 'Single Coil',
-      magneticPolarity: isRwrp ? 'South' : 'North',
-      electricalPhase: isRwrp ? 'Reverse-Phase' : 'In-Phase',
-      dcResistanceK: rK,
-      inductanceH: indH,
-    };
-  }
-
-  if (hotInGnd && gndInTip) {
-    // Reverse connected
-    return {
-      pickupId: comp.id,
-      pickupName: comp.name,
-      coilName: isRwrp ? 'Single Coil (RWRP Rev)' : 'Single Coil (Phase Inverted)',
-      magneticPolarity: isRwrp ? 'South' : 'North',
-      electricalPhase: isRwrp ? 'In-Phase' : 'Reverse-Phase',
-      dcResistanceK: rK,
-      inductanceH: indH,
-    };
-  }
-
-  return null;
-}
-
-function evaluateTeleNeck(
-  comp: CircuitComponent,
-  connectedToTip: Set<string>,
-  connectedToGround: Set<string>,
-  adj: Map<string, Set<string>>
-): ActiveCoilInfo | null {
-  const cid = comp.id;
-  const hot = `${cid}:hot`;
-  const gnd = `${cid}:ground`;
-  const rK = comp.properties.dcResistanceK ?? 7.4;
-  const indH = comp.properties.inductanceH ?? 2.6;
-
-  const hotInTip = connectedToTip.has(hot);
-  const gndInGnd = connectedToGround.has(gnd);
-
-  if (hotInTip && gndInGnd) {
-    return {
-      pickupId: comp.id,
-      pickupName: comp.name,
-      coilName: 'Tele Neck (Chrome Shielded)',
-      magneticPolarity: 'North',
-      electricalPhase: 'In-Phase',
-      dcResistanceK: rK,
-      inductanceH: indH,
-    };
-  }
-
-  return null;
-}
-
-function detectSeriesConfiguration(
-  coils: ActiveCoilInfo[],
-  adj: Map<string, Set<string>>,
-  connectedToGround: Set<string>,
-  connectedToTip?: Set<string>
-): boolean {
-  if (coils.length < 2) return false;
-  const uniquePickups = new Set(coils.map((c) => c.pickupId));
-  // A single humbucker with its two internal coils in series
-  if (uniquePickups.size === 1 && coils.length === 2) {
-    const puId = coils[0].pickupId;
-    const nFin = `${puId}:north-finish`;
-    const sFin = `${puId}:south-finish`;
-    const nFinNeighbors = getConnectedNodes(nFin, adj);
-    return (
-      nFinNeighbors.has(sFin) &&
-      !connectedToGround.has(nFin) &&
-      (!connectedToTip || !connectedToTip.has(nFin))
-    );
-  }
-  return false;
 }
 
 interface EdgeWithWire {
@@ -1312,223 +1004,53 @@ function findPathsBetween(
   return { pathNodes, pathWireIds };
 }
 
-function addHotInternalConnections(
+function addPotTrackEdges(
   comp: CircuitComponent,
+  wiredTerms: Set<string>,
+  connectedToGnd: Set<string> | null,
   addEdge: (a: string, b: string) => void
 ) {
   const cid = comp.id;
+  const safeAdd = (a: string, b: string) => {
+    // When building the hot signal graph, never bridge through a grounded pot lug
+    if (connectedToGnd && (connectedToGnd.has(a) || connectedToGnd.has(b))) return;
+    addEdge(a, b);
+  };
 
   switch (comp.type) {
-    case 'pot-standard': {
-      // Connect Lug 3 to Lug 2 (wiper) regardless of pot value (active at 0)
-      addEdge(`${cid}:lug-2`, `${cid}:lug-3`);
-      break;
-    }
+    case 'pot-standard':
     case 'pot-pushpull': {
-      addEdge(`${cid}:lug-2`, `${cid}:lug-3`);
-      const isPulled = !!comp.properties.pulledUp;
-      if (isPulled) {
-        addEdge(`${cid}:sw-c1`, `${cid}:sw-2`);
-        addEdge(`${cid}:sw-c2`, `${cid}:sw-4`);
-      } else {
-        addEdge(`${cid}:sw-c1`, `${cid}:sw-1`);
-        addEdge(`${cid}:sw-c2`, `${cid}:sw-3`);
+      const l1 = `${cid}:lug-1`;
+      const l2 = `${cid}:lug-2`;
+      const l3 = `${cid}:lug-3`;
+      safeAdd(l2, l3);
+      if (!wiredTerms.has(l3) && wiredTerms.has(l1) && wiredTerms.has(l2)) {
+        safeAdd(l1, l2);
       }
       break;
     }
     case 'pot-stacked': {
-      addEdge(`${cid}:a-lug-2`, `${cid}:a-lug-3`);
-      addEdge(`${cid}:b-lug-2`, `${cid}:b-lug-3`);
+      safeAdd(`${cid}:a-lug-2`, `${cid}:a-lug-3`);
+      if (
+        !wiredTerms.has(`${cid}:a-lug-3`) &&
+        wiredTerms.has(`${cid}:a-lug-1`) &&
+        wiredTerms.has(`${cid}:a-lug-2`)
+      ) {
+        safeAdd(`${cid}:a-lug-1`, `${cid}:a-lug-2`);
+      }
+      safeAdd(`${cid}:b-lug-2`, `${cid}:b-lug-3`);
+      if (
+        !wiredTerms.has(`${cid}:b-lug-3`) &&
+        wiredTerms.has(`${cid}:b-lug-1`) &&
+        wiredTerms.has(`${cid}:b-lug-2`)
+      ) {
+        safeAdd(`${cid}:b-lug-1`, `${cid}:b-lug-2`);
+      }
       break;
     }
     case 'pot-blend': {
-      addEdge(`${cid}:a-in`, `${cid}:a-wiper`);
-      addEdge(`${cid}:b-in`, `${cid}:b-wiper`);
-      break;
-    }
-    case 'switch-3way-toggle': {
-      const pos = comp.properties.switchPosition ?? 1; // 0=Bridge, 1=Both, 2=Neck
-      if (pos === 0 || pos === 1) addEdge(`${cid}:sw-bridge`, `${cid}:sw-output`);
-      if (pos === 2 || pos === 1) addEdge(`${cid}:sw-neck`, `${cid}:sw-output`);
-      break;
-    }
-    case 'switch-5way-blade': {
-      const pos = comp.properties.switchPosition ?? 0;
-      if (pos === 0) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-1`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-1`);
-      } else if (pos === 1) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-1`);
-        addEdge(`${cid}:p1-c`, `${cid}:p1-2`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-1`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-2`);
-      } else if (pos === 2) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-2`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-2`);
-      } else if (pos === 3) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-2`);
-        addEdge(`${cid}:p1-c`, `${cid}:p1-3`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-2`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-3`);
-      } else if (pos === 4) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-3`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-3`);
-      }
-      break;
-    }
-    case 'switch-3way-blade': {
-      const pos = comp.properties.switchPosition ?? 0;
-      if (pos === 0) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-1`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-1`);
-      } else if (pos === 1) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-1`);
-        addEdge(`${cid}:p1-c`, `${cid}:p1-3`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-1`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-3`);
-      } else if (pos === 2) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-3`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-3`);
-      }
-      break;
-    }
-    case 'switch-4way-blade': {
-      const pos = comp.properties.switchPosition ?? 0;
-      addEdge(`${cid}:p1-c`, `${cid}:p1-${pos + 1}`);
-      addEdge(`${cid}:p2-c`, `${cid}:p2-${pos + 1}`);
-      break;
-    }
-    case 'switch-superswitch': {
-      const pos = comp.properties.switchPosition ?? 0;
-      const throwNum = pos + 1;
-      addEdge(`${cid}:pa-c`, `${cid}:pa-${throwNum}`);
-      addEdge(`${cid}:pb-c`, `${cid}:pb-${throwNum}`);
-      addEdge(`${cid}:pc-c`, `${cid}:pc-${throwNum}`);
-      addEdge(`${cid}:pd-c`, `${cid}:pd-${throwNum}`);
-      break;
-    }
-    case 'switch-dpdt-minitoggle': {
-      const pos = comp.properties.switchPosition ?? 0;
-      if (pos === 0) {
-        addEdge(`${cid}:sw-c1`, `${cid}:sw-2`);
-        addEdge(`${cid}:sw-c2`, `${cid}:sw-4`);
-      } else {
-        addEdge(`${cid}:sw-c1`, `${cid}:sw-1`);
-        addEdge(`${cid}:sw-c2`, `${cid}:sw-3`);
-      }
-      break;
-    }
-    case 'capacitor': {
-      break;
-    }
-    case 'resistor': {
-      addEdge(`${cid}:lead-1`, `${cid}:lead-2`);
-      break;
-    }
-  }
-}
-
-function addGndInternalConnections(
-  comp: CircuitComponent,
-  addEdge: (a: string, b: string) => void
-) {
-  const cid = comp.id;
-
-  switch (comp.type) {
-    case 'ground-lug': {
-      addEdge(`${cid}:gnd-1`, `${cid}:gnd-2`);
-      addEdge(`${cid}:gnd-2`, `${cid}:gnd-3`);
-      addEdge(`${cid}:gnd-3`, `${cid}:gnd-bridge`);
-      break;
-    }
-    case 'switch-3way-toggle': {
-      const pos = comp.properties.switchPosition ?? 1;
-      if (pos === 0 || pos === 1) addEdge(`${cid}:sw-bridge`, `${cid}:sw-output`);
-      if (pos === 2 || pos === 1) addEdge(`${cid}:sw-neck`, `${cid}:sw-output`);
-      break;
-    }
-    case 'switch-5way-blade': {
-      const pos = comp.properties.switchPosition ?? 0;
-      if (pos === 0) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-1`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-1`);
-      } else if (pos === 1) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-1`);
-        addEdge(`${cid}:p1-c`, `${cid}:p1-2`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-1`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-2`);
-      } else if (pos === 2) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-2`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-2`);
-      } else if (pos === 3) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-2`);
-        addEdge(`${cid}:p1-c`, `${cid}:p1-3`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-2`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-3`);
-      } else if (pos === 4) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-3`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-3`);
-      }
-      break;
-    }
-    case 'switch-3way-blade': {
-      const pos = comp.properties.switchPosition ?? 0;
-      if (pos === 0) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-1`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-1`);
-      } else if (pos === 1) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-1`);
-        addEdge(`${cid}:p1-c`, `${cid}:p1-3`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-1`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-3`);
-      } else if (pos === 2) {
-        addEdge(`${cid}:p1-c`, `${cid}:p1-3`);
-        addEdge(`${cid}:p2-c`, `${cid}:p2-3`);
-      }
-      break;
-    }
-    case 'switch-4way-blade': {
-      const pos = comp.properties.switchPosition ?? 0;
-      addEdge(`${cid}:p1-c`, `${cid}:p1-${pos + 1}`);
-      addEdge(`${cid}:p2-c`, `${cid}:p2-${pos + 1}`);
-      break;
-    }
-    case 'switch-superswitch': {
-      const pos = comp.properties.switchPosition ?? 0;
-      const throwNum = pos + 1;
-      addEdge(`${cid}:pa-c`, `${cid}:pa-${throwNum}`);
-      addEdge(`${cid}:pb-c`, `${cid}:pb-${throwNum}`);
-      addEdge(`${cid}:pc-c`, `${cid}:pc-${throwNum}`);
-      addEdge(`${cid}:pd-c`, `${cid}:pd-${throwNum}`);
-      break;
-    }
-    case 'pot-pushpull': {
-      const isPulled = !!comp.properties.pulledUp;
-      if (isPulled) {
-        addEdge(`${cid}:sw-c1`, `${cid}:sw-2`);
-        addEdge(`${cid}:sw-c2`, `${cid}:sw-4`);
-      } else {
-        addEdge(`${cid}:sw-c1`, `${cid}:sw-1`);
-        addEdge(`${cid}:sw-c2`, `${cid}:sw-3`);
-      }
-      break;
-    }
-    case 'switch-dpdt-minitoggle': {
-      const pos = comp.properties.switchPosition ?? 0;
-      if (pos === 0) {
-        addEdge(`${cid}:sw-c1`, `${cid}:sw-2`);
-        addEdge(`${cid}:sw-c2`, `${cid}:sw-4`);
-      } else {
-        addEdge(`${cid}:sw-c1`, `${cid}:sw-1`);
-        addEdge(`${cid}:sw-c2`, `${cid}:sw-3`);
-      }
-      break;
-    }
-    case 'capacitor': {
-      break;
-    }
-    case 'resistor': {
-      addEdge(`${cid}:lead-1`, `${cid}:lead-2`);
+      safeAdd(`${cid}:a-in`, `${cid}:a-wiper`);
+      safeAdd(`${cid}:b-in`, `${cid}:b-wiper`);
       break;
     }
   }
@@ -1550,208 +1072,8 @@ export function computeSignalPath(state: CircuitState): SignalPathInfo {
   const jackTip = `${jack.id}:tip`;
   const jackSleeve = `${jack.id}:sleeve`;
 
-  const hotAdj = new Map<string, EdgeWithWire[]>();
-  const gndAdj = new Map<string, EdgeWithWire[]>();
-
-  function addHotEdge(a: string, b: string, wireId?: string) {
-    if (!hotAdj.has(a)) hotAdj.set(a, []);
-    if (!hotAdj.has(b)) hotAdj.set(b, []);
-    hotAdj.get(a)!.push({ neighbor: b, wireId });
-    hotAdj.get(b)!.push({ neighbor: a, wireId });
-  }
-
-  function addGndEdge(a: string, b: string, wireId?: string) {
-    if (!gndAdj.has(a)) gndAdj.set(a, []);
-    if (!gndAdj.has(b)) gndAdj.set(b, []);
-    gndAdj.get(a)!.push({ neighbor: b, wireId });
-    gndAdj.get(b)!.push({ neighbor: a, wireId });
-  }
-
-  // Add all physical circuit wires
-  for (const wire of wires) {
-    const k1 = `${wire.fromComponentId}:${wire.fromTerminalId}`;
-    const k2 = `${wire.toComponentId}:${wire.toTerminalId}`;
-    addHotEdge(k1, k2, wire.id);
-    addGndEdge(k1, k2, wire.id);
-  }
-
-  // Add internal connections based on switch positions and pot tracks
-  for (const comp of components) {
-    addHotInternalConnections(comp, (a, b) => addHotEdge(a, b));
-    addGndInternalConnections(comp, (a, b) => addGndEdge(a, b));
-  }
-
-  const connectedToTip = getConnectedNodesSet(jackTip, hotAdj);
-  const connectedToGnd = getConnectedNodesSet(jackSleeve, gndAdj);
-
-  // Short circuit check
-  const isShort = connectedToTip.has(jackSleeve);
-
-  // Find all pickups with completed closed electrical circuits
-  interface ActivePickupRecord {
-    compId: string;
-    hotTerm: string;
-    gndTerm: string;
-    seriesLinks?: [string, string];
-    seriesJunction?: [string, string];
-  }
-  const activePickups: ActivePickupRecord[] = [];
-  const activeHumbuckerCoils: Record<string, { north: boolean; south: boolean }> = {};
-
-  for (const comp of components) {
-    const cid = comp.id;
-    if (
-      comp.type === 'pickup-singlecoil' ||
-      comp.type === 'pickup-p90' ||
-      comp.type === 'pickup-tele-bridge' ||
-      comp.type === 'pickup-tele-neck'
-    ) {
-      const hot = `${cid}:hot`;
-      const gnd = `${cid}:ground`;
-      if (connectedToTip.has(hot) && connectedToGnd.has(gnd)) {
-        activePickups.push({ compId: comp.id, hotTerm: hot, gndTerm: gnd });
-      } else if (connectedToTip.has(gnd) && connectedToGnd.has(hot)) {
-        activePickups.push({ compId: comp.id, hotTerm: gnd, gndTerm: hot });
-      }
-    } else if (comp.type === 'pickup-humbucker') {
-      const nStart = `${cid}:north-start`;
-      const nFin = `${cid}:north-finish`;
-      const sFin = `${cid}:south-finish`;
-      const sStart = `${cid}:south-start`;
-
-      const nFinReachable = getConnectedNodesSet(nFin, hotAdj);
-      const isSeriesLinked = nFinReachable.has(sFin) && !connectedToGnd.has(nFin) && !connectedToTip.has(nFin);
-
-      if (isSeriesLinked && connectedToTip.has(nStart) && connectedToGnd.has(sStart)) {
-        activePickups.push({
-          compId: comp.id,
-          hotTerm: nStart,
-          gndTerm: sStart,
-          seriesLinks: [nFin, sFin],
-        });
-        activeHumbuckerCoils[comp.id] = { north: true, south: true };
-      } else if (isSeriesLinked && connectedToTip.has(sStart) && connectedToGnd.has(nStart)) {
-        activePickups.push({
-          compId: comp.id,
-          hotTerm: sStart,
-          gndTerm: nStart,
-          seriesLinks: [nFin, sFin],
-        });
-        activeHumbuckerCoils[comp.id] = { north: true, south: true };
-      } else {
-        const isNorthActive =
-          (connectedToTip.has(nStart) && connectedToGnd.has(nFin)) ||
-          (connectedToTip.has(nFin) && connectedToGnd.has(nStart));
-        const isSouthActive =
-          (connectedToTip.has(sFin) && connectedToGnd.has(sStart)) ||
-          (connectedToTip.has(sStart) && connectedToGnd.has(sFin));
-
-        if (isNorthActive) {
-          const hotTerm = connectedToTip.has(nStart) ? nStart : nFin;
-          const gndTerm = connectedToTip.has(nStart) ? nFin : nStart;
-          activePickups.push({ compId: comp.id, hotTerm, gndTerm });
-        }
-        if (isSouthActive) {
-          const hotTerm = connectedToTip.has(sFin) ? sFin : sStart;
-          const gndTerm = connectedToTip.has(sFin) ? sStart : sFin;
-          activePickups.push({ compId: comp.id, hotTerm, gndTerm });
-        }
-        activeHumbuckerCoils[comp.id] = { north: isNorthActive, south: isSouthActive };
-      }
-    }
-  }
-
-  // Check for pairs of pickups connected in SERIES across Tip and Ground
-  if (activePickups.length === 0) {
-    interface PathCandidate {
-      comp: CircuitComponent;
-      leadA: string;
-      leadB: string;
-      isHumbucker: boolean;
-    }
-    const pathCandidates: PathCandidate[] = [];
-    for (const comp of components) {
-      if (comp.type === 'pickup-humbucker') {
-        const cid = comp.id;
-        const nStart = `${cid}:north-start`;
-        const nFin = `${cid}:north-finish`;
-        const sFin = `${cid}:south-finish`;
-        const sStart = `${cid}:south-start`;
-        const nFinReachable = getConnectedNodesSet(nFin, hotAdj);
-        if (nFinReachable.has(sFin) && !connectedToGnd.has(nFin) && !connectedToTip.has(nFin)) {
-          pathCandidates.push({ comp, leadA: nStart, leadB: sStart, isHumbucker: true });
-        }
-      } else if (
-        comp.type === 'pickup-singlecoil' ||
-        comp.type === 'pickup-p90' ||
-        comp.type === 'pickup-tele-bridge' ||
-        comp.type === 'pickup-tele-neck'
-      ) {
-        pathCandidates.push({ comp, leadA: `${comp.id}:hot`, leadB: `${comp.id}:ground`, isHumbucker: false });
-      }
-    }
-
-    if (pathCandidates.length >= 2) {
-      for (let i = 0; i < pathCandidates.length; i++) {
-        for (let j = 0; j < pathCandidates.length; j++) {
-          if (i === j) continue;
-          const p1 = pathCandidates[i];
-          const p2 = pathCandidates[j];
-
-          const p1Leads = [
-            { tipLead: p1.leadA, juncLead: p1.leadB },
-            { tipLead: p1.leadB, juncLead: p1.leadA },
-          ];
-          const p2Leads = [
-            { juncLead: p2.leadA, gndLead: p2.leadB },
-            { juncLead: p2.leadB, gndLead: p2.leadA },
-          ];
-
-          let found = false;
-          for (const l1 of p1Leads) {
-            if (!connectedToTip.has(l1.tipLead)) continue;
-            if (connectedToGnd.has(l1.juncLead)) continue;
-
-            for (const l2 of p2Leads) {
-              if (!connectedToGnd.has(l2.gndLead)) continue;
-              if (connectedToGnd.has(l2.juncLead)) continue;
-
-              const juncReach = getConnectedNodesSet(l1.juncLead, hotAdj);
-              if (juncReach.has(l2.juncLead)) {
-                found = true;
-                activePickups.push({
-                  compId: p1.comp.id,
-                  hotTerm: l1.tipLead,
-                  gndTerm: l1.juncLead,
-                  seriesLinks: p1.isHumbucker ? [`${p1.comp.id}:north-finish`, `${p1.comp.id}:south-finish`] : undefined,
-                  seriesJunction: [l1.juncLead, l2.juncLead],
-                });
-                if (p1.isHumbucker) {
-                  activeHumbuckerCoils[p1.comp.id] = { north: true, south: true };
-                }
-
-                activePickups.push({
-                  compId: p2.comp.id,
-                  hotTerm: l2.juncLead,
-                  gndTerm: l2.gndLead,
-                  seriesLinks: p2.isHumbucker ? [`${p2.comp.id}:north-finish`, `${p2.comp.id}:south-finish`] : undefined,
-                });
-                if (p2.isHumbucker) {
-                  activeHumbuckerCoils[p2.comp.id] = { north: true, south: true };
-                }
-                break;
-              }
-            }
-            if (found) break;
-          }
-          if (found) break;
-        }
-        if (activePickups.length > 0) break;
-      }
-    }
-  }
-
-  if (activePickups.length === 0 || isShort) {
+  // 1. True galvanic short circuit check (never treats normal resistors or caps as shorts)
+  if (checkDirectShortCircuit(state)) {
     return {
       activeComponentIds: new Set<string>([jack.id]),
       activeWireIds: new Set<string>(),
@@ -1762,40 +1084,237 @@ export function computeSignalPath(state: CircuitState): SignalPathInfo {
     };
   }
 
+  // 2. Use MNA to determine which coils are genuinely active in the AC signal path
+  const actualSweep = solveCircuitMNA(state, REF_FREQS);
+  const refSweep = solveCircuitMNA(state, REF_FREQS, { potValueOverride: 1.0 });
+  if (!actualSweep || !refSweep) return emptyResult;
+
+  const actualPeaks = getCoilAudioBandPeaks(actualSweep);
+  const refPeaks = getCoilAudioBandPeaks(refSweep);
+  const maxActualPeak = actualPeaks.reduce((a, b) => Math.max(a, b), 0);
+  const maxRefPeak = refPeaks.reduce((a, b) => Math.max(a, b), 0);
+
+  if (maxActualPeak < COIL_ACTIVE_ABS_MIN && maxRefPeak < COIL_ACTIVE_ABS_MIN) {
+    return {
+      activeComponentIds: new Set<string>([jack.id]),
+      activeWireIds: new Set<string>(),
+      activeTerminalKeys: new Set<string>([jackTip, jackSleeve]),
+      activePickupIds: [],
+      hasSignalPath: false,
+      activeHumbuckerCoils: {},
+    };
+  }
+
+  const useRef = maxActualPeak < COIL_ACTIVE_ABS_MIN;
+  const sweep = useRef ? refSweep : actualSweep;
+  const peaks = useRef ? refPeaks : actualPeaks;
+  const maxPeak = useRef ? maxRefPeak : maxActualPeak;
+  const threshold = Math.max(COIL_ACTIVE_ABS_MIN, COIL_ACTIVE_REL_MIN * maxPeak);
+
+  const activeCoilModels: CoilModel[] = [];
+  for (let ci = 0; ci < sweep.coils.length; ci++) {
+    if (peaks[ci] >= threshold) {
+      activeCoilModels.push(sweep.coils[ci]);
+    }
+  }
+
+  if (activeCoilModels.length === 0) {
+    return {
+      activeComponentIds: new Set<string>([jack.id]),
+      activeWireIds: new Set<string>(),
+      activeTerminalKeys: new Set<string>([jackTip, jackSleeve]),
+      activePickupIds: [],
+      hasSignalPath: false,
+      activeHumbuckerCoils: {},
+    };
+  }
+
+  // 3. Build value-aware trace graphs for highlighting active wires, terminals, and components
+  const gndAdj = new Map<string, EdgeWithWire[]>();
+  const hotAdj = new Map<string, EdgeWithWire[]>();
+  const passiveTraceAdj = new Map<string, EdgeWithWire[]>(); // Wires + switches + pots (NO cap/resistor jumps)
+  const acGndAdj = new Map<string, EdgeWithWire[]>(); // Fallback ground graph allowing series caps/resistors on ground return
+
+  const pushEdge = (map: Map<string, EdgeWithWire[]>, a: string, b: string, wireId?: string) => {
+    if (!map.has(a)) map.set(a, []);
+    if (!map.has(b)) map.set(b, []);
+    map.get(a)!.push({ neighbor: b, wireId });
+    map.get(b)!.push({ neighbor: a, wireId });
+  };
+
+  const wiredTerms = new Set<string>();
+  for (const wire of wires) {
+    const k1 = `${wire.fromComponentId}:${wire.fromTerminalId}`;
+    const k2 = `${wire.toComponentId}:${wire.toTerminalId}`;
+    wiredTerms.add(k1);
+    wiredTerms.add(k2);
+    pushEdge(gndAdj, k1, k2, wire.id);
+    pushEdge(hotAdj, k1, k2, wire.id);
+    pushEdge(passiveTraceAdj, k1, k2, wire.id);
+    pushEdge(acGndAdj, k1, k2, wire.id);
+  }
+
+  // First pass: switches, ground-lugs, and dead-short resistors (< 100 Ohm) into gndAdj
+  for (const comp of components) {
+    addSwitchAndGroundEdges(comp, (a, b) => {
+      pushEdge(gndAdj, a, b);
+      pushEdge(hotAdj, a, b);
+      pushEdge(passiveTraceAdj, a, b);
+      pushEdge(acGndAdj, a, b);
+    });
+    if (comp.type === 'resistor') {
+      const rOhms = comp.properties.resistanceOhms ?? 150000;
+      if (rOhms < SHORT_RESISTOR_THRESHOLD_OHMS) {
+        pushEdge(gndAdj, `${comp.id}:lead-1`, `${comp.id}:lead-2`);
+      }
+    }
+  }
+
+  const connectedToGnd = getConnectedNodesSet(jackSleeve, gndAdj);
+  const galvanicTipNodes = getConnectedNodesSet(jackTip, gndAdj);
+
+  // Second pass: add pot tracks and series-eligible resistors/capacitors
+  for (const comp of components) {
+    addPotTrackEdges(comp, wiredTerms, connectedToGnd, (a, b) => {
+      pushEdge(hotAdj, a, b);
+    });
+    addPotTrackEdges(comp, wiredTerms, null, (a, b) => {
+      pushEdge(passiveTraceAdj, a, b);
+    });
+
+    if (comp.type === 'resistor' || comp.type === 'capacitor') {
+      const l1 = `${comp.id}:lead-1`;
+      const l2 = `${comp.id}:lead-2`;
+      const l1Gnd = connectedToGnd.has(l1);
+      const l2Gnd = connectedToGnd.has(l2);
+
+      // Include in hotAdj ONLY if neither lead is directly grounded (so shunt load resistors
+      // and grounded tone caps never bridge hot to ground, while series caps & resistors pass!)
+      if (!l1Gnd && !l2Gnd) {
+        pushEdge(hotAdj, l1, l2);
+      }
+
+      // Include in fallback acGndAdj ONLY if neither lead is on the direct jack-tip bus
+      if (!galvanicTipNodes.has(l1) && !galvanicTipNodes.has(l2)) {
+        pushEdge(acGndAdj, l1, l2);
+      }
+    }
+  }
+
+  const connectedToTip = getConnectedNodesSet(jackTip, hotAdj);
+
   const activeComponentIds = new Set<string>([jack.id]);
   const activeWireIds = new Set<string>();
   const activeTerminalKeys = new Set<string>([jackTip, jackSleeve]);
-  const activePickupIds: string[] = [];
+  const activePickupIdsSet = new Set<string>();
+  const activeHumbuckerCoils: Record<string, { north: boolean; south: boolean }> = {};
 
-  // Trace hot and ground paths for every active pickup
-  for (const ap of activePickups) {
-    activePickupIds.push(ap.compId);
-    activeComponentIds.add(ap.compId);
-    activeTerminalKeys.add(ap.hotTerm);
-    activeTerminalKeys.add(ap.gndTerm);
+  // Group active coils by pickup to highlight coils, hot/ground returns, and series junctions
+  const coilsByPickup = new Map<string, CoilModel[]>();
+  for (const coil of activeCoilModels) {
+    activePickupIdsSet.add(coil.pickupId);
+    activeComponentIds.add(coil.pickupId);
+    if (!coilsByPickup.has(coil.pickupId)) coilsByPickup.set(coil.pickupId, []);
+    coilsByPickup.get(coil.pickupId)!.push(coil);
 
-    const hotPath = findPathsBetween(jackTip, ap.hotTerm, hotAdj);
-    hotPath.pathNodes.forEach((n) => activeTerminalKeys.add(n));
-    hotPath.pathWireIds.forEach((w) => activeWireIds.add(w));
-
-    const gndPath = findPathsBetween(jackSleeve, ap.gndTerm, gndAdj);
-    gndPath.pathNodes.forEach((n) => activeTerminalKeys.add(n));
-    gndPath.pathWireIds.forEach((w) => activeWireIds.add(w));
-
-    if (ap.seriesLinks) {
-      activeTerminalKeys.add(ap.seriesLinks[0]);
-      activeTerminalKeys.add(ap.seriesLinks[1]);
-      const seriesPath = findPathsBetween(ap.seriesLinks[0], ap.seriesLinks[1], hotAdj);
-      seriesPath.pathNodes.forEach((n) => activeTerminalKeys.add(n));
-      seriesPath.pathWireIds.forEach((w) => activeWireIds.add(w));
+    if (coil.pickupType === 'pickup-humbucker') {
+      if (!activeHumbuckerCoils[coil.pickupId]) {
+        activeHumbuckerCoils[coil.pickupId] = { north: false, south: false };
+      }
+      if (coil.bobbin === 'north') activeHumbuckerCoils[coil.pickupId].north = true;
+      if (coil.bobbin === 'south') activeHumbuckerCoils[coil.pickupId].south = true;
     }
+  }
 
-    if (ap.seriesJunction) {
-      activeTerminalKeys.add(ap.seriesJunction[0]);
-      activeTerminalKeys.add(ap.seriesJunction[1]);
-      const junctionPath = findPathsBetween(ap.seriesJunction[0], ap.seriesJunction[1], hotAdj);
-      junctionPath.pathNodes.forEach((n) => activeTerminalKeys.add(n));
-      junctionPath.pathWireIds.forEach((w) => activeWireIds.add(w));
+  const addPathToActive = (p: { pathNodes: Set<string>; pathWireIds: Set<string> }) => {
+    p.pathNodes.forEach((n) => activeTerminalKeys.add(n));
+    p.pathWireIds.forEach((w) => activeWireIds.add(w));
+  };
+
+  // Track pickup-level terminals that aren't directly connected to Tip or Ground (inter-pickup series junctions)
+  const seriesEndpointTerms: string[] = [];
+
+  for (const [puId, coils] of coilsByPickup) {
+    if (coils[0].pickupType === 'pickup-humbucker') {
+      const nStart = `${puId}:north-start`;
+      const nFin = `${puId}:north-finish`;
+      const sFin = `${puId}:south-finish`;
+      const sStart = `${puId}:south-start`;
+
+      if (coils.length === 2) {
+        const nFinReach = getConnectedNodesSet(nFin, hotAdj);
+        const isInternalSeries =
+          nFinReach.has(sFin) && !connectedToGnd.has(nFin) && !connectedToTip.has(nFin);
+
+        if (isInternalSeries) {
+          activeTerminalKeys.add(nStart);
+          activeTerminalKeys.add(nFin);
+          activeTerminalKeys.add(sFin);
+          activeTerminalKeys.add(sStart);
+          addPathToActive(findPathsBetween(nFin, sFin, hotAdj));
+
+          for (const term of [nStart, sStart]) {
+            if (connectedToTip.has(term)) {
+              addPathToActive(findPathsBetween(jackTip, term, hotAdj));
+            } else if (connectedToGnd.has(term)) {
+              addPathToActive(findPathsBetween(jackSleeve, term, gndAdj));
+            } else {
+              seriesEndpointTerms.push(term);
+            }
+          }
+          continue;
+        }
+      }
+
+      // Parallel or split humbucker coils
+      for (const coil of coils) {
+        activeTerminalKeys.add(coil.posTerm);
+        activeTerminalKeys.add(coil.negTerm);
+        for (const term of [coil.posTerm, coil.negTerm]) {
+          if (connectedToTip.has(term)) {
+            addPathToActive(findPathsBetween(jackTip, term, hotAdj));
+          } else if (connectedToGnd.has(term)) {
+            addPathToActive(findPathsBetween(jackSleeve, term, gndAdj));
+          } else {
+            const acGndPath = findPathsBetween(jackSleeve, term, acGndAdj);
+            if (acGndPath.pathNodes.size > 0) {
+              addPathToActive(acGndPath);
+            } else {
+              seriesEndpointTerms.push(term);
+            }
+          }
+        }
+      }
+    } else {
+      const coil = coils[0];
+      activeTerminalKeys.add(coil.posTerm);
+      activeTerminalKeys.add(coil.negTerm);
+      for (const term of [coil.posTerm, coil.negTerm]) {
+        if (connectedToTip.has(term)) {
+          addPathToActive(findPathsBetween(jackTip, term, hotAdj));
+        } else if (connectedToGnd.has(term)) {
+          addPathToActive(findPathsBetween(jackSleeve, term, gndAdj));
+        } else {
+          const acGndPath = findPathsBetween(jackSleeve, term, acGndAdj);
+          if (acGndPath.pathNodes.size > 0) {
+            addPathToActive(acGndPath);
+          } else {
+            seriesEndpointTerms.push(term);
+          }
+        }
+      }
+    }
+  }
+
+  // Trace inter-pickup series junctions between ungrounded/non-tip pickup endpoints
+  for (let i = 0; i < seriesEndpointTerms.length; i++) {
+    for (let j = i + 1; j < seriesEndpointTerms.length; j++) {
+      const t1 = seriesEndpointTerms[i];
+      const t2 = seriesEndpointTerms[j];
+      const p = findPathsBetween(t1, t2, hotAdj);
+      if (p.pathNodes.size > 0) {
+        addPathToActive(p);
+      }
     }
   }
 
@@ -1806,81 +1325,79 @@ export function computeSignalPath(state: CircuitState): SignalPathInfo {
       comp.type === 'pot-pushpull' ||
       comp.type === 'pot-stacked'
     ) {
-      const lug1 = comp.type === 'pot-stacked' ? `${comp.id}:a-lug-1` : `${comp.id}:lug-1`;
-      const lug2 = comp.type === 'pot-stacked' ? `${comp.id}:a-lug-2` : `${comp.id}:lug-2`;
-      const lug3 = comp.type === 'pot-stacked' ? `${comp.id}:a-lug-3` : `${comp.id}:lug-3`;
+      const gangs =
+        comp.type === 'pot-stacked'
+          ? [
+              [`${comp.id}:a-lug-1`, `${comp.id}:a-lug-2`, `${comp.id}:a-lug-3`],
+              [`${comp.id}:b-lug-1`, `${comp.id}:b-lug-2`, `${comp.id}:b-lug-3`],
+            ]
+          : [[`${comp.id}:lug-1`, `${comp.id}:lug-2`, `${comp.id}:lug-3`]];
 
-      const isPotInHot = activeTerminalKeys.has(lug2) || activeTerminalKeys.has(lug3);
-      if (isPotInHot) {
-        activeComponentIds.add(comp.id);
-        activeTerminalKeys.add(lug2);
-        activeTerminalKeys.add(lug3);
-
-        if (connectedToGnd.has(lug1)) {
-          activeTerminalKeys.add(lug1);
-          const vGndPath = findPathsBetween(jackSleeve, lug1, gndAdj);
-          vGndPath.pathNodes.forEach((n) => activeTerminalKeys.add(n));
-          vGndPath.pathWireIds.forEach((w) => activeWireIds.add(w));
+      for (const [lug1, lug2, lug3] of gangs) {
+        const isPotInHot = activeTerminalKeys.has(lug2) || activeTerminalKeys.has(lug3);
+        if (isPotInHot) {
+          activeComponentIds.add(comp.id);
+          activeTerminalKeys.add(lug2);
+          activeTerminalKeys.add(lug3);
+          if (connectedToGnd.has(lug1)) {
+            activeTerminalKeys.add(lug1);
+            addPathToActive(findPathsBetween(jackSleeve, lug1, gndAdj));
+          }
         }
       }
     }
   }
 
-  // Trace tone networks and treble bleed networks
+  // Trace shunt networks (tone caps, load resistors, tuned-split caps/resistors) and treble bleeds
+  // using passiveTraceAdj (no internal cap/resistor jumps, so each passive part's two leads are distinct!)
+  const gndViaPotNodes = getConnectedNodesSet(jackSleeve, passiveTraceAdj);
+
   for (const comp of components) {
     if (comp.type === 'capacitor' || comp.type === 'resistor') {
       const lead1 = `${comp.id}:lead-1`;
       const lead2 = `${comp.id}:lead-2`;
 
-      const lead1Reach = getConnectedNodesSet(lead1, hotAdj);
-      const lead2Reach = getConnectedNodesSet(lead2, hotAdj);
-
-      const lead1ReachesHot = Array.from(activeTerminalKeys).some((tk) => lead1Reach.has(tk));
-      const lead2ReachesHot = Array.from(activeTerminalKeys).some((tk) => lead2Reach.has(tk));
-
-      const lead1ReachesGnd = connectedToGnd.has(lead1);
-      const lead2ReachesGnd = connectedToGnd.has(lead2);
-
-      // Tone network: one side connected to active hot path, other side to ground
-      if ((lead1ReachesHot && lead2ReachesGnd) || (lead2ReachesHot && lead1ReachesGnd)) {
+      // If already traced as an inline series component on the hot/ground path, skip shunt logic
+      if (activeTerminalKeys.has(lead1) && activeTerminalKeys.has(lead2)) {
         activeComponentIds.add(comp.id);
-        activeTerminalKeys.add(lead1);
-        activeTerminalKeys.add(lead2);
-
-        const hotSide = lead1ReachesHot ? lead1 : lead2;
-        const gndSide = lead1ReachesHot ? lead2 : lead1;
-
-        const matchingHot = Array.from(activeTerminalKeys).find((tk) =>
-          getConnectedNodesSet(hotSide, hotAdj).has(tk)
-        );
-        if (matchingHot) {
-          const capHotPath = findPathsBetween(matchingHot, hotSide, hotAdj);
-          capHotPath.pathNodes.forEach((n) => activeTerminalKeys.add(n));
-          capHotPath.pathWireIds.forEach((w) => activeWireIds.add(w));
-        }
-
-        const capGndPath = findPathsBetween(jackSleeve, gndSide, gndAdj);
-        capGndPath.pathNodes.forEach((n) => activeTerminalKeys.add(n));
-        capGndPath.pathWireIds.forEach((w) => activeWireIds.add(w));
+        continue;
       }
 
-      // Treble bleed: both leads connected across active hot terminals
-      if (lead1ReachesHot && lead2ReachesHot && !lead1ReachesGnd && !lead2ReachesGnd) {
+      const lead1Reach = getConnectedNodesSet(lead1, passiveTraceAdj);
+      const lead2Reach = getConnectedNodesSet(lead2, passiveTraceAdj);
+
+      const lead1MatchingHot = Array.from(activeTerminalKeys).find(
+        (tk) => !connectedToGnd.has(tk) && lead1Reach.has(tk)
+      );
+      const lead2MatchingHot = Array.from(activeTerminalKeys).find(
+        (tk) => !connectedToGnd.has(tk) && lead2Reach.has(tk)
+      );
+
+      const lead1ReachesGnd = connectedToGnd.has(lead1) || (!lead1MatchingHot && gndViaPotNodes.has(lead1));
+      const lead2ReachesGnd = connectedToGnd.has(lead2) || (!lead2MatchingHot && gndViaPotNodes.has(lead2));
+
+      // Shunt network: Tone RC, load resistor to ground, or tuned-split cap/resistor to ground
+      if ((lead1MatchingHot && lead2ReachesGnd) || (lead2MatchingHot && lead1ReachesGnd)) {
         activeComponentIds.add(comp.id);
         activeTerminalKeys.add(lead1);
         activeTerminalKeys.add(lead2);
-        const node1 = Array.from(activeTerminalKeys).find((tk) => lead1Reach.has(tk));
-        const node2 = Array.from(activeTerminalKeys).find((tk) => lead2Reach.has(tk));
-        if (node1) {
-          const p = findPathsBetween(node1, lead1, hotAdj);
-          p.pathNodes.forEach((n) => activeTerminalKeys.add(n));
-          p.pathWireIds.forEach((w) => activeWireIds.add(w));
-        }
-        if (node2) {
-          const p = findPathsBetween(node2, lead2, hotAdj);
-          p.pathNodes.forEach((n) => activeTerminalKeys.add(n));
-          p.pathWireIds.forEach((w) => activeWireIds.add(w));
-        }
+
+        const hotSide = lead1MatchingHot ? lead1 : lead2;
+        const gndSide = lead1MatchingHot ? lead2 : lead1;
+        const matchingHot = lead1MatchingHot || lead2MatchingHot!;
+
+        addPathToActive(findPathsBetween(matchingHot, hotSide, passiveTraceAdj));
+        const gndPath = connectedToGnd.has(gndSide)
+          ? findPathsBetween(jackSleeve, gndSide, gndAdj)
+          : findPathsBetween(jackSleeve, gndSide, passiveTraceAdj);
+        addPathToActive(gndPath);
+      } else if (lead1MatchingHot && lead2MatchingHot && !connectedToGnd.has(lead1) && !connectedToGnd.has(lead2)) {
+        // Treble bleed network: both leads connected across active hot terminals (e.g. Vol lug 3 & lug 2)
+        activeComponentIds.add(comp.id);
+        activeTerminalKeys.add(lead1);
+        activeTerminalKeys.add(lead2);
+        addPathToActive(findPathsBetween(lead1MatchingHot, lead1, passiveTraceAdj));
+        addPathToActive(findPathsBetween(lead2MatchingHot, lead2, passiveTraceAdj));
       }
     }
   }
@@ -1904,7 +1421,7 @@ export function computeSignalPath(state: CircuitState): SignalPathInfo {
     activeComponentIds,
     activeWireIds,
     activeTerminalKeys,
-    activePickupIds,
+    activePickupIds: Array.from(activePickupIdsSet),
     hasSignalPath: true,
     activeHumbuckerCoils,
   };
@@ -1938,7 +1455,31 @@ export function getCircuitResultSignature(result: CircuitAnalysisResult): string
   const phaseRelationship = isSolo ? 'solo' : result.phaseRelationship;
   const resK = Math.round((result.estimatedTotalResistanceK || 0) * 10) / 10;
   const indH = Math.round((result.estimatedTotalInductanceH || 0) * 100) / 100;
-  const freqHz = Math.round((result.resonantFrequencyHz || 0) / 10) * 10;
+  const freqHz = Math.round((result.resonantFrequencyHz || 0) / 25) * 25;
+  const qBucket = Math.round((result.qFactor || 1) * 5) / 5;
+
+  // Detect significant bass-cut / series-cap high-pass tilt (100 Hz vs 1 kHz)
+  let bassTiltBucket = 0;
+  if (result.frequencyResponse && result.frequencyResponse.length > 0) {
+    let db100 = 0;
+    let db1000 = 0;
+    let d100 = Infinity;
+    let d1000 = Infinity;
+    for (const pt of result.frequencyResponse) {
+      if (Math.abs(pt.freq - 100) < d100) {
+        d100 = Math.abs(pt.freq - 100);
+        db100 = pt.db;
+      }
+      if (Math.abs(pt.freq - 1000) < d1000) {
+        d1000 = Math.abs(pt.freq - 1000);
+        db1000 = pt.db;
+      }
+    }
+    const diff = db1000 - db100;
+    if (diff > 2.5) {
+      bassTiltBucket = Math.round(diff / 3) * 3;
+    }
+  }
 
   return [
     pickupKeys,
@@ -1950,6 +1491,8 @@ export function getCircuitResultSignature(result: CircuitAnalysisResult): string
     resK,
     indH,
     freqHz,
+    qBucket,
+    bassTiltBucket,
   ].join(':::');
 }
 
@@ -1961,13 +1504,14 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
   const { components, wires } = state;
 
   // Identify all switches
-  const switches = components.filter((c) =>
-    c.type === 'switch-5way-blade' ||
-    c.type === 'switch-3way-toggle' ||
-    c.type === 'switch-3way-blade' ||
-    c.type === 'switch-4way-blade' ||
-    c.type === 'switch-superswitch' ||
-    c.type === 'switch-dpdt-minitoggle'
+  const switches = components.filter(
+    (c) =>
+      c.type === 'switch-5way-blade' ||
+      c.type === 'switch-3way-toggle' ||
+      c.type === 'switch-3way-blade' ||
+      c.type === 'switch-4way-blade' ||
+      c.type === 'switch-superswitch' ||
+      c.type === 'switch-dpdt-minitoggle'
   );
 
   // Identify all push-pull pots
@@ -2084,7 +1628,7 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
       }
     }
     configs = nextConfigs;
-    if (configs.length > 64) break;
+    if (configs.length > 128) break;
   }
 
   // If no switches or push-pulls exist, evaluate the single current state
@@ -2101,7 +1645,6 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
   let maxF = 0;
 
   configs.forEach((cfg, index) => {
-    // Clone components and assign this configuration
     const testComponents = components.map((c) => {
       const swMatch = cfg.switches.find((s) => s.compId === c.id);
       const ppMatch = cfg.pushPulls.find((p) => p.compId === c.id);
@@ -2120,7 +1663,6 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
 
     const result = analyzeCircuit({ components: testComponents, wires });
 
-    // Check if this matches current state
     const isCurrent =
       cfg.switches.every((s) => {
         const c = components.find((comp) => comp.id === s.compId);
@@ -2131,7 +1673,6 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
         return !!c?.properties.pulledUp === p.pulledUp;
       });
 
-    // Generate descriptive labels
     const labelParts: string[] = [];
     if (cfg.switches.length > 0) {
       labelParts.push(cfg.switches.map((s) => `${s.label}`).join(' + '));
@@ -2141,7 +1682,6 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
     }
     const combinationLabel = labelParts.length > 0 ? labelParts.join(' | ') : 'Standard Wiring State';
 
-    // Summary of active pickups
     const activePickupSummary =
       result.activePickups.length > 0
         ? result.activePickups.map((p) => p.name).join(' + ')
@@ -2149,13 +1689,11 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
         ? 'Active Circuit'
         : 'Muted / Open';
 
-    // Summary of active coils
     const activeCoilsSummary =
       result.activeCoils.length > 0
         ? result.activeCoils.map((c) => `${c.pickupName} (${c.coilName})`).join(' + ')
         : 'None';
 
-    // Tonal description
     let toneDescription = '';
     if (!result.hasOutputSignal) {
       toneDescription = 'Muted / Killswitch position (No output to jack)';
@@ -2206,7 +1744,7 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
 
   // --- MULTI-DIMENSIONAL REDUCTION FOR GROUPING EQUIVALENT COMBINATIONS ---
   interface ReductionNode {
-    pattern: (number | null)[]; // null represents '*' (wildcard covering all options of that control)
+    pattern: (number | null)[];
     resultSignature: string;
     items: SwitchingCombinationReportItem[];
   }
@@ -2233,12 +1771,10 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
         const numOptions = controls[d].options.length;
         if (numOptions < 2) continue;
 
-        // Group nodes by (resultSignature + all other dimensions)
         const buckets = new Map<string, ReductionNode[]>();
 
         for (const node of nodes) {
           if (node.pattern[d] === null) {
-            // Already wildcard on dimension d, isolate in unique bucket
             const soloKey = `__wildcard_iso_${d}_${Math.random()}`;
             buckets.set(soloKey, [node]);
             continue;
@@ -2272,10 +1808,9 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
             }
 
             if (allOptionsPresent) {
-              // MERGE along dimension d!
               changed = true;
               const mergedPattern = [...bucketNodes[0].pattern];
-              mergedPattern[d] = null; // Wildcard '*'!
+              mergedPattern[d] = null;
 
               const mergedItems: SwitchingCombinationReportItem[] = [];
               for (const bn of bucketNodes) {
@@ -2291,7 +1826,6 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
             }
           }
 
-          // Keep nodes unmerged if full coverage condition wasn't met
           for (const bn of bucketNodes) {
             nextNodes.push(bn);
           }
@@ -2303,12 +1837,14 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
   }
 
   // --- CONSOLIDATE REDUCTION NODES INTO TRULY DISTINCT TONAL STATES ---
-  // (Removes redundant duplicate rows that produce the identical electrical/tonal sound)
-  const signatureMap = new Map<string, {
-    signature: string;
-    items: SwitchingCombinationReportItem[];
-    nodes: ReductionNode[];
-  }>();
+  const signatureMap = new Map<
+    string,
+    {
+      signature: string;
+      items: SwitchingCombinationReportItem[];
+      nodes: ReductionNode[];
+    }
+  >();
 
   for (const node of nodes) {
     if (!signatureMap.has(node.resultSignature)) {
@@ -2323,9 +1859,16 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
     entry.nodes.push(node);
   }
 
-  // Separate active playable tones from muted / dead switch positions
-  const activeEntries: { signature: string; items: SwitchingCombinationReportItem[]; nodes: ReductionNode[] }[] = [];
-  const mutedEntries: { signature: string; items: SwitchingCombinationReportItem[]; nodes: ReductionNode[] }[] = [];
+  const activeEntries: {
+    signature: string;
+    items: SwitchingCombinationReportItem[];
+    nodes: ReductionNode[];
+  }[] = [];
+  const mutedEntries: {
+    signature: string;
+    items: SwitchingCombinationReportItem[];
+    nodes: ReductionNode[];
+  }[] = [];
 
   for (const [sig, entry] of signatureMap.entries()) {
     if (sig === 'MUTED_NO_SIGNAL' || !entry.items[0]?.result.hasOutputSignal) {
@@ -2335,11 +1878,6 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
     }
   }
 
-  // Sort active entries logically:
-  // 1. Solo Bridge pickups (full, then split)
-  // 2. Solo Neck pickups (full, then split slug, split screw)
-  // 3. Parallel combinations (in-phase, then out-of-phase)
-  // 4. Series combinations (in-phase, then out-of-phase)
   activeEntries.sort((a, b) => {
     const resA = a.items[0].result;
     const resB = b.items[0].result;
@@ -2366,9 +1904,6 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
     const representativeItem =
       entry.items.find((it) => it.isCurrentState) || entry.items[0];
 
-    // Compute consolidated control values:
-    // If every combination for this tone shares the exact same option for a control, show that option;
-    // otherwise show wildcard '*' indicating this control doesn't change this tone.
     const controlValues: GroupedControlValue[] = controls.map((ctrl) => {
       const optionIndices = new Set<number>();
       for (const item of entry.items) {
@@ -2422,7 +1957,6 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
     };
   });
 
-  // Handle fallback if no switches or push-pulls exist
   if (controls.length === 0 && items.length > 0) {
     const item = items[0];
     groupedItems.push({
@@ -2440,7 +1974,6 @@ export function analyzeAllSwitchingCombinations(state: CircuitState): SwitchingA
     });
   }
 
-  // Summary counts across distinct active playable tones
   let humCancellingCount = 0;
   let splitCoilCount = 0;
   let outOfPhaseCount = 0;

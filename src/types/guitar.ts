@@ -159,6 +159,7 @@ export interface CircuitAnalysisResult {
   totalCapacitancePf?: number;
   isCoilSplit?: boolean;
   gainOffsetDb?: number;
+  frequencyResponse?: { freq: number; db: number }[];
 }
 
 export interface WiringPreset {

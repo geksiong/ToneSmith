@@ -68,49 +68,36 @@ export const FrequencyResponsePlot: React.FC<FrequencyPlotProps> = ({ analysis }
     ? '#8b5cf6'
     : '#f59e0b';
 
-  // Calculate electrical gain in dB at given frequency
+  // Interpolate exact electrical response from MNA solver when available
+  const interpolateMnaDb = (f: number): number | null => {
+    const curve = analysis.frequencyResponse;
+    if (!curve || curve.length < 2) return null;
+    if (f <= curve[0].freq) return curve[0].db;
+    if (f >= curve[curve.length - 1].freq) return curve[curve.length - 1].db;
+
+    // Binary search for bracketing frequency bins
+    let lo = 0;
+    let hi = curve.length - 1;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (curve[mid].freq <= f) lo = mid;
+      else hi = mid;
+    }
+
+    const f0 = curve[lo].freq;
+    const f1 = curve[hi].freq;
+    const logFrac =
+      f1 > f0 ? (Math.log10(f) - Math.log10(f0)) / (Math.log10(f1) - Math.log10(f0)) : 0;
+    return curve[lo].db + logFrac * (curve[hi].db - curve[lo].db);
+  };
+
+  // Calculate electrical + acoustic gain in dB at given frequency
   const calculateGainAtFreq = (f: number): number => {
     if (!analysis.hasOutputSignal) return -60;
 
-    const f0 = analysis.resonantFrequencyHz;
-    const q = analysis.qFactor;
-    const toneCutoff = analysis.effectiveToneCutoffHz;
-    const volLevel = analysis.effectiveVolumeLevel;
     const numPickups = analysis.activePickups.length;
 
-    // 1. Volume pot attenuation in dB
-    const volDb = 20 * Math.log10(Math.max(0.001, volLevel));
-
-    // 2. Base gain offset (series +4dB, coil split -4.5dB, parallel -1.5dB)
-    const gainOffsetDb = analysis.gainOffsetDb ?? (isSeries ? 4.0 : isCoilSplit ? -4.5 : isParallel ? -1.5 : 0.0);
-
-    // 3. Second-order RLC transfer function magnitude
-    // H(s) = 1 / sqrt((1 - (f/f0)^2)^2 + (f / (f0 * Q))^2)
-    const ratio = f / f0;
-    const denom = Math.sqrt(Math.pow(1 - ratio * ratio, 2) + Math.pow(ratio / q, 2));
-    const rlcGain = 1 / Math.max(0.001, denom);
-    let rlcDb = 20 * Math.log10(rlcGain);
-
-    // 4. Tone Pot Rolloff and "Woman Tone" low-mid resonance
-    let toneDb = 0;
-    if (toneCutoff < 18000) {
-      if (toneCutoff < 1200) {
-        // Tone knob near zero (0.022µF - 0.047µF capacitor fully shunting pickup)
-        // Produces the classic 400-500Hz resonance bump followed by steep cut
-        const womanFreq = Math.max(340, Math.min(520, toneCutoff * 0.9));
-        const wRatio = f / womanFreq;
-        const wDenom = Math.sqrt(Math.pow(1 - wRatio * wRatio, 2) + Math.pow(wRatio / 1.5, 2));
-        const womanGain = 1 / Math.max(0.01, wDenom);
-        toneDb = 18 * Math.log10(womanGain) - 20 * Math.log10(1 + Math.pow(f / toneCutoff, 2));
-        // Fade out original high-frequency RLC peak
-        rlcDb = rlcDb * Math.min(1.0, Math.pow(toneCutoff / 3000, 1.3));
-      } else {
-        // Intermediate tone settings
-        toneDb = -10 * Math.log10(1 + Math.pow(f / toneCutoff, 2));
-      }
-    }
-
-    // 5. Acoustic Phase and Comb Filtering
+    // Acoustic Phase and Comb Filtering (physical pickup spacing along the string)
     let phaseDb = 0;
     if (isOutOfPhase) {
       // Peter Green Out-of-Phase cancellation:
@@ -136,6 +123,40 @@ export const FrequencyResponsePlot: React.FC<FrequencyPlotProps> = ({ analysis }
       const combDist = Math.abs(Math.log2(f / combFreq));
       if (combDist < 0.8) {
         phaseDb = -3.2 * Math.exp(-Math.pow(combDist / 0.35, 2));
+      }
+    }
+
+    // Prefer real MNA frequency sweep (accurately models load resistors, series caps, treble bleeds, tone rolloff, tuned splits)
+    const mnaDb = interpolateMnaDb(f);
+    if (mnaDb !== null) {
+      return Math.max(minDb - 5, Math.min(maxDb + 6, mnaDb + phaseDb));
+    }
+
+    // Fallback parametric RLC model if frequencyResponse is unavailable
+    const f0 = analysis.resonantFrequencyHz;
+    const q = analysis.qFactor;
+    const toneCutoff = analysis.effectiveToneCutoffHz;
+    const volLevel = analysis.effectiveVolumeLevel;
+
+    const volDb = 20 * Math.log10(Math.max(0.001, volLevel));
+    const gainOffsetDb = analysis.gainOffsetDb ?? (isSeries ? 4.0 : isCoilSplit ? -4.5 : isParallel ? -1.5 : 0.0);
+
+    const ratio = f / f0;
+    const denom = Math.sqrt(Math.pow(1 - ratio * ratio, 2) + Math.pow(ratio / q, 2));
+    const rlcGain = 1 / Math.max(0.001, denom);
+    let rlcDb = 20 * Math.log10(rlcGain);
+
+    let toneDb = 0;
+    if (toneCutoff < 18000) {
+      if (toneCutoff < 1200) {
+        const womanFreq = Math.max(340, Math.min(520, toneCutoff * 0.9));
+        const wRatio = f / womanFreq;
+        const wDenom = Math.sqrt(Math.pow(1 - wRatio * wRatio, 2) + Math.pow(wRatio / 1.5, 2));
+        const womanGain = 1 / Math.max(0.01, wDenom);
+        toneDb = 18 * Math.log10(womanGain) - 20 * Math.log10(1 + Math.pow(f / toneCutoff, 2));
+        rlcDb = rlcDb * Math.min(1.0, Math.pow(toneCutoff / 3000, 1.3));
+      } else {
+        toneDb = -10 * Math.log10(1 + Math.pow(f / toneCutoff, 2));
       }
     }
 
