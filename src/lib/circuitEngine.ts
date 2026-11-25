@@ -732,7 +732,7 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
     const h60 = evalHumAtBin(0);
     const h180 = evalHumAtBin(1);
 
-    // Weighted mains hum spectrum (75% power at 60 Hz fundamental, 25% at 180 Hz 3rd harmonic)
+    // Weighted mains hum spectrum (75% power at 60 Hz fundamental, 25% at 180 Hz 3rd harmonic) for display
     const combinedRatio = Math.sqrt(0.75 * h60.ratio * h60.ratio + 0.25 * h180.ratio * h180.ratio);
     const minCancelFactor = Math.min(h60.cancelFactor, h180.cancelFactor);
 
@@ -741,10 +741,16 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
     const rawHumDb = 20 * Math.log10(Math.max(1e-6, combinedRatio));
     residualHumDb = Math.max(-120, Math.round(rawHumDb * 10) / 10);
 
+    // Classify status on the worse of the two probe frequencies (60 Hz & 180 Hz) so a deep
+    // 60 Hz null cannot mask weaker 180 Hz harmonic cancellation (which is more audible)
+    const worstDb = 20 * Math.log10(Math.max(1e-6, Math.max(h60.ratio, h180.ratio)));
+    const worstDbRounded = Math.max(-120, Math.round(worstDb * 10) / 10);
+    const worstFreqHz = h180.ratio >= h60.ratio ? 180 : 60;
+
     const inPhaseCount = activeCoils.filter((c) => c.electricalPhase === 'In-Phase').length;
     const revPhaseCount = activeCoils.filter((c) => c.electricalPhase === 'Reverse-Phase').length;
 
-    if (hasOpposingCancellation && residualHumDb <= -20) {
+    if (hasOpposingCancellation && worstDb <= -20) {
       isHumCancelling = true;
       humStatus = 'cancelling';
       if (residualHumDb > -45) {
@@ -752,10 +758,14 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
       } else {
         humReason = 'Hum-cancelling active! Reverse-wound / opposite electrical polarity cancels 60Hz EMI.';
       }
-    } else if (hasOpposingCancellation && residualHumDb <= -6) {
+    } else if (hasOpposingCancellation && worstDb <= -6) {
       isHumCancelling = false;
       humStatus = 'reduced';
-      humReason = `Partial hum reduction (${residualHumDb} dB vs. single coil) — opposing windings reduce 60Hz EMI, but residual hum remains.`;
+      if (Math.abs(worstDbRounded - residualHumDb) >= 2) {
+        humReason = `Partial hum reduction (${residualHumDb} dB weighted, ${worstDbRounded} dB at ${worstFreqHz}Hz vs. single coil) — opposing windings reduce EMI, but residual hum remains.`;
+      } else {
+        humReason = `Partial hum reduction (${residualHumDb} dB vs. single coil) — opposing windings reduce 60Hz EMI, but residual hum remains.`;
+      }
     } else {
       isHumCancelling = false;
       humStatus = 'present';
