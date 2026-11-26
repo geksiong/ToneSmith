@@ -53,6 +53,19 @@ export interface MNASolveOptions {
   includeExternalLoad?: boolean;
   /** Exclude cable/stray capacitance (default: false) */
   excludeCableCap?: boolean;
+  /**
+   * Strip passive shunt/track networks for topology probing:
+   * removes pot resistive tracks, resistors (>= SHORT_RESISTOR_THRESHOLD_OHMS),
+   * and capacitors while keeping wires, closed switch contacts, and pot
+   * wiper-to-end-lug pass-through contacts (independent of live knob positions).
+   */
+  stripPassiveNetworks?: boolean;
+  /**
+   * Strip pot resistive tracks (keeping wiper-to-end-lug pass-through contacts)
+   * while retaining resistors and capacitors (fallback when a series cap or
+   * series resistor is required in the signal path).
+   */
+  stripPotTracks?: boolean;
 }
 
 export interface MNASweepResult {
@@ -468,6 +481,9 @@ function buildNetlist(state: CircuitState, options: MNASolveOptions = {}): Built
     }
   }
 
+  const stripPassive = !!options.stripPassiveNetworks;
+  const stripTracks = stripPassive || !!options.stripPotTracks;
+
   // Helper to stamp a standard 3-lug potentiometer gang
   const stampPotGang = (
     comp: CircuitComponent,
@@ -483,6 +499,39 @@ function buildNetlist(state: CircuitState, options: MNASolveOptions = {}): Built
     const l2Wired = wiredTerms.has(lug2);
     const l3Wired = wiredTerms.has(lug3);
     if (!l2Wired && !(l1Wired && l3Wired)) return;
+
+    if (stripTracks) {
+      // For topology probing: keep only the wiper-to-end-lug pass-through contact
+      // and remove resistive tracks so pot tracks across a coil cannot mask series wiring
+      // and knob positions do not affect topology classification.
+      if (l1Wired && l2Wired && l3Wired) {
+        const r1 = uf.find(lug1);
+        const r3 = uf.find(lug3);
+        if (r3 === gndRoot && r1 !== gndRoot) {
+          addRes(lug1, lug2, R_MIN_POT_OHMS);
+        } else {
+          addRes(lug2, lug3, R_MIN_POT_OHMS);
+        }
+        return;
+      }
+
+      if (!l1Wired && l2Wired && l3Wired) {
+        const r2 = uf.find(lug2);
+        const r3 = uf.find(lug3);
+        const isShuntOrTone =
+          r2 === gndRoot ||
+          r3 === gndRoot ||
+          capConnectedRoots.has(r2) ||
+          capConnectedRoots.has(r3);
+        if (!isShuntOrTone) {
+          addRes(lug2, lug3, R_MIN_POT_OHMS);
+        }
+        return;
+      }
+
+      // 2-lug shunt/tone rheostat on lugs 1 & 2, or fixed track on lugs 1 & 3: omit
+      return;
+    }
 
     const effVal =
       options.potValueOverrides?.has(comp.id)
@@ -536,11 +585,20 @@ function buildNetlist(state: CircuitState, options: MNASolveOptions = {}): Built
     switch (comp.type) {
       case 'resistor': {
         const rOhms = comp.properties.resistanceOhms ?? 150000;
+        if (stripPassive) {
+          if (rOhms < SHORT_RESISTOR_THRESHOLD_OHMS) {
+            addRes(`${cid}:lead-1`, `${cid}:lead-2`, Math.max(1, rOhms));
+          }
+          break;
+        }
         addRes(`${cid}:lead-1`, `${cid}:lead-2`, Math.max(1, rOhms));
         break;
       }
 
       case 'capacitor': {
+        if (stripPassive) {
+          break;
+        }
         const capUf = comp.properties.capacitanceUf ?? 0.022;
         addCap(`${cid}:lead-1`, `${cid}:lead-2`, Math.max(1e-9, capUf) * 1e-6);
         break;
@@ -583,6 +641,16 @@ function buildNetlist(state: CircuitState, options: MNASolveOptions = {}): Built
       }
 
       case 'pot-blend': {
+        if (stripTracks) {
+          if (wiredTerms.has(`${cid}:a-in`) && wiredTerms.has(`${cid}:a-wiper`)) {
+            addRes(`${cid}:a-in`, `${cid}:a-wiper`, R_MIN_POT_OHMS);
+          }
+          if (wiredTerms.has(`${cid}:b-in`) && wiredTerms.has(`${cid}:b-wiper`)) {
+            addRes(`${cid}:b-in`, `${cid}:b-wiper`, R_MIN_POT_OHMS);
+          }
+          break;
+        }
+
         const rPot = Math.max(100, (comp.properties.resistanceK ?? 250) * 1000);
         const blendVal =
           options.potValueOverrides?.has(comp.id)

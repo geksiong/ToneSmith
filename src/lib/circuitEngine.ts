@@ -17,6 +17,7 @@ import {
   SHORT_RESISTOR_THRESHOLD_OHMS,
   CoilModel,
   ComplexVal,
+  MNASolveOptions,
   MNASweepResult,
   addSwitchAndGroundEdges,
   checkDirectShortCircuit,
@@ -277,12 +278,53 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
     pickupCoilIndices.get(c.pickupId)!.push(ci);
   }
 
-  // 4. Detect series vs parallel topology via MNA open-circuit coupling test
-  const topoOptions = isMutedByPot ? { potValueOverride: 1.0 } : {};
-  const topoBase = solveCircuitMNA(state, TOPOLOGY_PROBE_FREQS, topoOptions)!;
-  const topoBaseMax = topoBase.coils.map((_, ci) =>
+  // 4. Detect series vs parallel topology via stripped-network MNA open-circuit coupling test.
+  // Removing pot tracks, resistors, and capacitors isolates pure wire/switch/wiper-contact
+  // connectivity so networks spanning a coil (e.g. series-blend volume pots, partial/tuned splits,
+  // load resistors) cannot mask series coupling and live knob positions cannot alter the verdict.
+  const TOPO_SIGNAL_MIN = 1e-3;
+  let topoOptions: MNASolveOptions = {
+    stripPassiveNetworks: true,
+    excludeCableCap: true,
+  };
+  let topoBase = solveCircuitMNA(state, TOPOLOGY_PROBE_FREQS, topoOptions)!;
+  let topoBaseMax = topoBase.coils.map((_, ci) =>
     Math.max(cMag(topoBase.transfers[ci][0]), cMag(topoBase.transfers[ci][1]))
   );
+
+  // If any active coil lacks a galvanic path in the stripped circuit (e.g., a series coupling or
+  // HOOP capacitor is required for its signal path), fall back to stripping only pot tracks
+  // (keeping series caps/resistors), and finally to open-pot MNA if needed.
+  if (activeCoilIndices.some((ci) => topoBaseMax[ci] <= TOPO_SIGNAL_MIN)) {
+    const potTracksStrippedOptions: MNASolveOptions = {
+      stripPotTracks: true,
+      excludeCableCap: true,
+    };
+    const fallbackBase = solveCircuitMNA(state, TOPOLOGY_PROBE_FREQS, potTracksStrippedOptions);
+    if (fallbackBase) {
+      const fallbackMax = fallbackBase.coils.map((_, ci) =>
+        Math.max(cMag(fallbackBase.transfers[ci][0]), cMag(fallbackBase.transfers[ci][1]))
+      );
+      if (activeCoilIndices.every((ci) => fallbackMax[ci] > TOPO_SIGNAL_MIN)) {
+        topoOptions = potTracksStrippedOptions;
+        topoBase = fallbackBase;
+        topoBaseMax = fallbackMax;
+      } else {
+        const openPotOptions: MNASolveOptions = {
+          potValueOverride: 1.0,
+          excludeCableCap: true,
+        };
+        const openPotBase = solveCircuitMNA(state, TOPOLOGY_PROBE_FREQS, openPotOptions);
+        if (openPotBase) {
+          topoOptions = openPotOptions;
+          topoBase = openPotBase;
+          topoBaseMax = openPotBase.coils.map((_, ci) =>
+            Math.max(cMag(openPotBase.transfers[ci][0]), cMag(openPotBase.transfers[ci][1]))
+          );
+        }
+      }
+    }
+  }
 
   // Check intra-humbucker series vs parallel
   const humbuckerInternalSeries = new Map<string, boolean>();
@@ -695,7 +737,8 @@ export function analyzeCircuit(state: CircuitState): CircuitAnalysisResult {
   // 9b. Exact AC MNA Hum-Cancellation Analysis (60 Hz fundamental + 180 Hz 3rd harmonic)
   // Ambient mains EMI depends strictly on each coil's winding sense & electrical lead orientation
   // (independent of permanent magnet polarity) and sums through the full passive impedance network.
-  const humSweep = solveCircuitMNA(state, HUM_PROBE_FREQS, topoOptions);
+  const humOptions: MNASolveOptions = isMutedByPot ? { potValueOverride: 1.0 } : {};
+  const humSweep = solveCircuitMNA(state, HUM_PROBE_FREQS, humOptions);
   let isHumCancelling = false;
   let humStatus: 'cancelling' | 'reduced' | 'present' | 'none' = 'present';
   let residualHumDb = 0;
